@@ -171,3 +171,29 @@ if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
             --res-dir results/test_finetune\
             --num-step 16
 fi
+
+if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
+      echo "Stage 8: RL Fine-tune the ZipVoice model using aishell 3 data"
+
+      [ -z "$max_len" ] && { echo "Error: max_len is not set!" >&2; exit 1; }
+
+      python3 -m zipvoice.bin.train_zipvoice \
+            --world-size 4 \
+            --use-fp16 1 \
+            --finetune 1 \
+            --base-lr 0.0001 \
+            --num-iters 10000 \
+            --save-every-n 1000 \
+            --max-duration 500 \
+            --max-len ${max_len} \
+            --model-config ${download_dir}/zipvoice/model.json \
+            --checkpoint ${download_dir}/zipvoice/model.pt \
+            --tokenizer ${tokenizer} \
+            --lang ${lang} \
+            --token-file ${download_dir}/zipvoice/tokens.txt \
+            --dataset custom \
+            --train-manifest data/fbank/custom-finetune_cuts_train.jsonl.gz \
+            --dev-manifest data/fbank/custom-finetune_cuts_dev.jsonl.gz \
+            --exp-dir exp/zipvoice_finetune
+
+fi

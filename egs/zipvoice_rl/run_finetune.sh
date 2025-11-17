@@ -177,25 +177,14 @@ fi
 if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
       echo "Stage 8: RL Fine-tune the ZipVoice model using aishell 3 data"
 
-      [ -z "$max_len" ] && { echo "Error: max_len is not set!" >&2; exit 1; }
+      # [ -z "$max_len" ] && { echo "Error: max_len is not set!" >&2; exit 1; }
 
       python3 -m zipvoice.bin.train_zipvoice_grpo \
-            --world-size 4 \
-            --use-fp16 1 \
-            --finetune 1 \
-            --base-lr 0.0001 \
-            --num-iters 10000 \
-            --save-every-n 1000 \
-            --max-duration 500 \
-            --max-len ${max_len} \
-            --model-config ${download_dir}/zipvoice/model.json \
-            --checkpoint ${download_dir}/zipvoice/model.pt \
-            --tokenizer ${tokenizer} \
-            --lang ${lang} \
-            --token-file ${download_dir}/zipvoice/tokens.txt \
-            --dataset aishell3 \
-            --exp-dir exp/zipvoice_finetune \
-            --on-the-fly-feats True
+      --world-size 2 \
+      --use-fp16 1 \
+      --exp-dir exp/zipvoice_grpo \
+      --pretrained-model zipvoice_distill \
+      --dataset-path aishell-3-cosy.jsonl
 
 fi
 

@@ -57,7 +57,8 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
-from pipeline_zipvoice import ZipVoicePipeline
+from zipvoice.rl.stat_tracking import PerPromptStatTracker
+from zipvoice.rl.pipeline_zipvoice import ZipVoicePipeline
 from zipvoice.models.modules.solver import sde_step_with_logprob
 from zipvoice.utils.checkpoint import (
     load_checkpoint,
@@ -209,17 +210,26 @@ def compute_log_prob(model, pipeline, sample, j, params):
     timesteps = sample["timesteps"]
     step_index = (timesteps[0] == timesteps[:, j][0]).nonzero().item()
 
-    current_t = timesteps[:, step_index]
-    next_t = timesteps[:, step_index + 1]
+    current_t = timesteps[0, step_index]
+    # print(f"current_t: {current_t}, current_t.shape: {current_t.shape}")
+    # breakpoint()
+    next_t = timesteps[0, step_index + 1]
 
     # Predict the velocity
+    guidance_scale = params.guidance_scale
+    if not torch.is_tensor(guidance_scale):
+        guidance_scale = torch.tensor(
+            guidance_scale, dtype=current_t.dtype, device=next_t.device
+        )
+
+    # TODO: check zipvoice and zipvoice_distill difference
     v = model.forward_fm_decoder(
         t=current_t,
-        xt=latents,
-        text_condition=sample["text_condition"],
-        speech_condition=sample["speech_condition"],
-        padding_mask=sample["padding_mask"],
-        guidance_scale=params.guidance_scale,
+        xt=latents.clone(),
+        text_condition=sample["text_condition"].clone(),
+        speech_condition=sample["speech_condition"].clone(),
+        padding_mask=sample["padding_mask"].clone(),
+        guidance_scale=guidance_scale,
     )
 
     # Compute the log prob of next_latents given latents under the current model
@@ -227,8 +237,8 @@ def compute_log_prob(model, pipeline, sample, j, params):
         v,
         sigma_prev=next_t,
         sigma=current_t,
-        sample=latents,
-        prev_sample=sample["next_latents"][:, j],
+        sample=latents.clone(),
+        prev_sample=sample["next_latents"][:, j].clone(),
         noise_level=params.noise_level,
         sde_type="cps",  # Make sure this matches the one used in sampling
     )
@@ -309,6 +319,18 @@ def get_parser():
     parser.add_argument("--adv-clip-max", type=float, default=5)
     parser.add_argument("--clip-range", type=float, default=1e-4)
     parser.add_argument(
+        "--per-prompt-stat-tracking",
+        type=str2bool,
+        default=True,
+        help="Whether to use per-prompt stat tracking.",
+    )
+    parser.add_argument(
+        "--global-std",
+        type=str2bool,
+        default=False,
+        help="Whether to use global std for advantage normalization.",
+    )
+    parser.add_argument(
         "--use-fp16",
         type=str2bool,
         default=True,
@@ -334,6 +356,7 @@ def train(params: AttributeDict, rank: int, world_size: int):
     """The main training loop."""
     device = torch.device("cuda", rank)
     fix_random_seed(params.seed)
+    torch.autograd.set_detect_anomaly(True)
 
     # Setup logging
     if rank == 0:
@@ -343,6 +366,9 @@ def train(params: AttributeDict, rank: int, world_size: int):
     # Load TTS model via pipeline
     pipeline = ZipVoicePipeline(model_name=params.pretrained_model, device=device)
     model = pipeline.model
+
+    if params.per_prompt_stat_tracking:
+        stat_tracker = PerPromptStatTracker(global_std=params.global_std)
 
     # For now, we train the full model.
     model_parameters = list(model.parameters())
@@ -414,6 +440,9 @@ def train(params: AttributeDict, rank: int, world_size: int):
             ids, prompt_wavs_list, prompt_texts_list, target_texts_list = next(
                 train_iter
             )
+            prompts = [
+                p + " " + t for p, t in zip(prompt_texts_list, target_texts_list)
+            ]
 
             with torch.no_grad():
                 with autocast():
@@ -457,6 +486,7 @@ def train(params: AttributeDict, rank: int, world_size: int):
 
             samples.append(
                 {
+                    "prompts": prompts,
                     "latents": latents[:, :-1],
                     "next_latents": latents[:, 1:],
                     "log_probs": log_probs,
@@ -475,49 +505,70 @@ def train(params: AttributeDict, rank: int, world_size: int):
                 for k, v in rewards.items()
             }
 
-        rewards_cat = {
-            key: torch.cat([s["rewards"][key] for s in samples])
-            for key in samples[0]["rewards"]
-        }
-        samples_cat = {
-            key: torch.cat([s[key] for s in samples])
-            for key in samples[0]
-            if key != "rewards"
-        }
-        samples_cat["rewards"] = rewards_cat
-        samples = samples_cat
+        # Advantage calculation
+        all_prompts = [p for s in samples for p in s["prompts"]]
+        all_rewards = torch.cat(
+            [s["rewards"]["placeholder_reward"] for s in samples], dim=0
+        )
 
-        # Advantage calculation with global stats
-        local_rewards = samples["rewards"]["placeholder_reward"]
         if world_size > 1:
-            # Gather rewards from all GPUs
-            local_size = torch.tensor([local_rewards.size(0)], device=device)
+            # Gather rewards
+            local_size = torch.tensor([all_rewards.size(0)], device=device)
             all_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
             torch.distributed.all_gather(all_sizes, local_size)
             max_size = max(s.item() for s in all_sizes)
 
             padded_rewards = torch.zeros(max_size, device=device)
-            padded_rewards[: local_rewards.size(0)] = local_rewards
-            
-            all_rewards_padded = [torch.zeros_like(padded_rewards) for _ in range(world_size)]
+            padded_rewards[: all_rewards.size(0)] = all_rewards
+
+            all_rewards_padded = [
+                torch.zeros_like(padded_rewards) for _ in range(world_size)
+            ]
             torch.distributed.all_gather(all_rewards_padded, padded_rewards)
 
-            # Unpad and concatenate
-            all_rewards = []
+            gathered_rewards = []
             for i in range(world_size):
-                all_rewards.append(all_rewards_padded[i][:all_sizes[i].item()])
-            
-            all_rewards_tensor = torch.cat(all_rewards)
-            mean = all_rewards_tensor.mean()
-            std = all_rewards_tensor.std() + 1e-8
-        else:
-            mean = local_rewards.mean()
-            std = local_rewards.std() + 1e-8
-        
-        advantages = (local_rewards - mean) / std
-        samples["advantages"] = advantages.unsqueeze(1).repeat(1, num_train_timesteps)
+                gathered_rewards.append(all_rewards_padded[i][: all_sizes[i].item()])
+            gathered_rewards_tensor = torch.cat(gathered_rewards)
 
-        del samples["rewards"]
+            # Gather prompts
+            gathered_prompts_list = [None] * world_size
+            torch.distributed.all_gather_object(gathered_prompts_list, all_prompts)
+            gathered_prompts = [
+                item for sublist in gathered_prompts_list for item in sublist
+            ]
+        else:
+            gathered_rewards_tensor = all_rewards
+            gathered_prompts = all_prompts
+
+        if params.per_prompt_stat_tracking:
+            advantages = stat_tracker.update(
+                gathered_prompts, gathered_rewards_tensor.cpu().numpy()
+            )
+            stat_tracker.clear()
+        else:
+            mean = gathered_rewards_tensor.mean()
+            std = gathered_rewards_tensor.std() + 1e-8
+            advantages = (gathered_rewards_tensor - mean) / std
+            advantages = advantages.cpu().numpy()
+
+        advantages = torch.as_tensor(advantages, device=device, dtype=torch.float32)
+
+        # Distribute advantages
+        local_advantages = advantages.chunk(world_size)[rank]
+
+        # Add advantages to samples
+        current_pos = 0
+        for s in samples:
+            batch_size = s["latents"].shape[0]
+            s["advantages"] = (
+                local_advantages[current_pos : current_pos + batch_size]
+                .unsqueeze(1)
+                .repeat(1, num_train_timesteps)
+            )
+            current_pos += batch_size
+            del s["rewards"]
+            del s["prompts"]
 
         #################### TRAINING ####################
         for inner_epoch in range(params.num_inner_epochs):
@@ -526,54 +577,65 @@ def train(params: AttributeDict, rank: int, world_size: int):
             else:
                 model.train()
             
+            random.shuffle(samples)
             optimizer.zero_grad()
             
-            for j in tqdm(
-                range(num_train_timesteps),
+            for i, sample_batch in tqdm(
+                enumerate(samples),
                 desc=f"Epoch {epoch}.{inner_epoch}: training",
                 disable=rank != 0,
+                total=len(samples)
             ):
-                with autocast():
-                    unwrapped_model = model.module if isinstance(model, DDP) else model
-                    log_prob = compute_log_prob(
-                        unwrapped_model, pipeline, samples, j, params
+                loss_per_batch = 0
+                for j in range(num_train_timesteps):
+                    with autocast():
+                        unwrapped_model = model.module if isinstance(model, DDP) else model
+                        log_prob = compute_log_prob(
+                            unwrapped_model, pipeline, sample_batch, j, params
+                        )
+
+                        advantages = torch.clamp(
+                            sample_batch["advantages"][:, j],
+                            -params.adv_clip_max,
+                            params.adv_clip_max,
+                        )
+                        ratio = torch.exp(log_prob - sample_batch["log_probs"][:, j])
+
+                        unclipped_loss = -advantages * ratio
+                        clipped_loss = -advantages * torch.clamp(
+                            ratio,
+                            1.0 - params.clip_range,
+                            1.0 + params.clip_range,
+                        )
+                        loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+                        
+                        # Accumulate loss over timesteps
+                        loss_per_batch = loss_per_batch + loss / num_train_timesteps
+
+                # Accumulate loss for gradient accumulation
+                loss_to_backward = loss_per_batch / params.gradient_accumulation_steps
+                scaler.scale(loss_to_backward).backward()
+                
+                if (i + 1) % params.gradient_accumulation_steps == 0 or (i + 1) == len(samples):
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), params.max_grad_norm
                     )
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
 
-                    advantages = torch.clamp(
-                        samples["advantages"][:, j],
-                        -params.adv_clip_max,
-                        params.adv_clip_max,
-                    )
-                    ratio = torch.exp(log_prob - samples["log_probs"][:, j])
-
-                    unclipped_loss = -advantages * ratio
-                    clipped_loss = -advantages * torch.clamp(
-                        ratio,
-                        1.0 - params.clip_range,
-                        1.0 + params.clip_range,
-                    )
-                    loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-                    # Normalize loss by number of timesteps for accumulation
-                    loss = loss / num_train_timesteps
-
-                scaler.scale(loss).backward()
-            
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), params.max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
-
-            # Logging
-            if rank == 0:
-                wandb.log(
-                    {
-                        "loss": loss.item() * num_train_timesteps, # Log unnormalized loss
-                        "epoch": epoch,
-                        "inner_epoch": inner_epoch,
-                    },
-                    step=global_step,
-                )
-            global_step += 1
+                    # Logging
+                    if rank == 0:
+                        wandb.log(
+                            {
+                                "loss": loss_to_backward.item() * params.gradient_accumulation_steps, # Log unnormalized batch loss
+                                "epoch": epoch,
+                                "inner_epoch": inner_epoch,
+                            },
+                            step=global_step,
+                        )
+                    global_step += 1
         
         # Checkpointing
         if epoch > 0 and epoch % params.save_freq == 0:

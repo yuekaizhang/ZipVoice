@@ -220,6 +220,7 @@ def prepare_input(
     return_tokens: bool = True,
     return_feature: bool = True,
     return_audio: bool = False,
+    tokenizer: Any = None,
 ):
     """
     Parse the features and targets of the current batch.
@@ -232,11 +233,18 @@ def prepare_input(
         for the format of the `batch`.
       device:
         The device of Tensor.
+      tokenizer:
+        The tokenizer for tokenization.
     """
     return_list = []
 
     if return_tokens:
-        return_list += [batch["tokens"]]
+        if "tokens" in batch:
+            return_list += [batch["tokens"]]
+        else:
+            assert tokenizer is not None
+            tokens = tokenizer.texts_to_token_ids(batch["text"])
+            return_list += [tokens]
 
     if return_feature:
         features = batch["features"].to(device)

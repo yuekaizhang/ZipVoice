@@ -16,9 +16,58 @@
 # limitations under the License.
 
 from typing import Optional, Union
-
+import math
 import torch
 
+from typing import Tuple, List
+def randn_tensor(
+    shape: Union[Tuple, List],
+    generator: Optional[Union[List["torch.Generator"], "torch.Generator"]] = None,
+    device: Optional[Union[str, "torch.device"]] = None,
+    dtype: Optional["torch.dtype"] = None,
+    layout: Optional["torch.layout"] = None,
+):
+    """A helper function to create random tensors on the desired `device` with the desired `dtype`. When
+    passing a list of generators, you can seed each batch size individually. If CPU generators are passed, the tensor
+    is always created on the CPU.
+    """
+    # device on which tensor is created defaults to device
+    if isinstance(device, str):
+        device = torch.device(device)
+    rand_device = device
+    batch_size = shape[0]
+
+    layout = layout or torch.strided
+    device = device or torch.device("cpu")
+
+    if generator is not None:
+        gen_device_type = generator.device.type if not isinstance(generator, list) else generator[0].device.type
+        if gen_device_type != device.type and gen_device_type == "cpu":
+            rand_device = "cpu"
+            if device != "mps":
+                logger.info(
+                    f"The passed generator was created on 'cpu' even though a tensor on {device} was expected."
+                    f" Tensors will be created on 'cpu' and then moved to {device}. Note that one can probably"
+                    f" slightly speed up this function by passing a generator that was created on the {device} device."
+                )
+        elif gen_device_type != device.type and gen_device_type == "cuda":
+            raise ValueError(f"Cannot generate a {device} tensor from a generator of type {gen_device_type}.")
+
+    # make sure generator list of length 1 is treated like a non-list
+    if isinstance(generator, list) and len(generator) == 1:
+        generator = generator[0]
+
+    if isinstance(generator, list):
+        shape = (1,) + shape[1:]
+        latents = [
+            torch.randn(shape, generator=generator[i], device=rand_device, dtype=dtype, layout=layout)
+            for i in range(batch_size)
+        ]
+        latents = torch.cat(latents, dim=0).to(device)
+    else:
+        latents = torch.randn(shape, generator=generator, device=rand_device, dtype=dtype, layout=layout).to(device)
+
+    return latents
 
 class DiffusionModel(torch.nn.Module):
     """A wrapper of diffusion models for inference.
@@ -165,6 +214,67 @@ class DistillDiffusionModel(DiffusionModel):
         )
 
 
+def sde_step_with_logprob(
+    model_output: torch.FloatTensor,
+    sigma_prev: torch.FloatTensor,
+    sigma: torch.FloatTensor,
+    sample: torch.FloatTensor,
+    noise_level: float = 0.7,
+    prev_sample: Optional[torch.FloatTensor] = None,
+    generator: Optional[torch.Generator] = None,
+    sde_type: Optional[str] = 'cps',
+):
+    """
+    Predict the sample from the previous timestep by reversing the SDE. This function propagates the flow
+    process from the learned model outputs (most often the predicted velocity).
+
+    Args:
+        model_output (`torch.FloatTensor`):
+            The direct output from learned flow model.
+        timestep (`float`):
+            The current discrete timestep in the diffusion chain.
+        sample (`torch.FloatTensor`):
+            A current instance of a sample created by the diffusion process.
+        generator (`torch.Generator`, *optional*):
+            A random number generator.
+    """
+    # bf16 can overflow here when compute prev_sample_mean, we must convert all variable to fp32
+    model_output=model_output.float()
+    sample=sample.float()
+    if prev_sample is not None:
+        prev_sample=prev_sample.float()
+
+    # step_index = [self.index_for_timestep(t) for t in timestep]
+    # prev_step_index = [step+1 for step in step_index]
+    # sigma = self.sigmas[step_index].view(-1, *([1] * (len(sample.shape) - 1)))
+    # sigma_prev = self.sigmas[prev_step_index].view(-1, *([1] * (len(sample.shape) - 1)))
+    # sigma_max = self.sigmas[1].item()
+    dt = sigma_prev - sigma
+
+    assert sde_type == 'cps'
+    std_dev_t = sigma_prev  * math.sin(noise_level * math.pi / 2) # sigma_t in paper
+    pred_original_sample = sample - sigma * model_output # predicted x_0 in paper
+    noise_estimate = sample + model_output * (1 - sigma) # predicted x_1 in paper
+    prev_sample_mean = pred_original_sample * (1 - sigma_prev) + noise_estimate * torch.sqrt(sigma_prev**2 - std_dev_t**2)
+
+    if prev_sample is None:
+        variance_noise = randn_tensor(
+            model_output.shape,
+            generator=generator,
+            device=model_output.device,
+            dtype=model_output.dtype,
+        )
+        prev_sample = prev_sample_mean + std_dev_t * variance_noise
+
+    # remove all constants
+    # TODO: add mask here
+    log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2)
+
+    # mean along all but batch dimension
+    log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+    
+    return prev_sample, log_prob, prev_sample_mean, std_dev_t
+
 class EulerSolver:
     def __init__(
         self,
@@ -190,6 +300,8 @@ class EulerSolver:
         t_start: float = 0.0,
         t_end: float = 1.0,
         t_shift: float = 1.0,
+        enable_sde: bool = False,
+        sde_noise_level: float = 0.1,
         **kwargs
     ) -> torch.Tensor:
         """
@@ -236,8 +348,22 @@ class EulerSolver:
                 guidance_scale=guidance_scale,
                 **kwargs
             )
-            x = x + v * (timesteps[step + 1] - timesteps[step])
-        return x
+            if enable_sde:
+                print(f"noise_level: {sde_noise_level}")
+                x, log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
+                    v,
+                    timesteps[step + 1],
+                    timesteps[step],
+                    x,
+                    noise_level=sde_noise_level,
+                )
+            else:
+                x = x + v * (timesteps[step + 1] - timesteps[step])
+
+        if enable_sde:
+            return x, log_prob, prev_sample_mean, std_dev_t
+        else:
+            return x
 
 
 class DistillEulerSolver(EulerSolver):

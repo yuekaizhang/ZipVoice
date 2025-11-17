@@ -397,6 +397,8 @@ class ZipVoice(nn.Module):
         duration: str = "predict",
         num_step: int = 5,
         guidance_scale: float = 0.5,
+        enable_sde: bool = False,
+        sde_noise_level: float = 0.1,
     ) -> torch.Tensor:
         """
         Generate acoustic features, given text tokens, prompts feature
@@ -456,16 +458,28 @@ class ZipVoice(nn.Module):
             prompt_features.size(-1),
             device=text_condition.device,
         )
-
-        x1 = self.solver.sample(
-            x=x0,
-            text_condition=text_condition,
-            speech_condition=speech_condition,
-            padding_mask=padding_mask,
-            num_step=num_step,
-            guidance_scale=guidance_scale,
-            t_shift=t_shift,
-        )
+        if enable_sde:
+            x1, log_prob, prev_sample_mean, std_dev_t = self.solver.sample(
+                x=x0,
+                text_condition=text_condition,
+                speech_condition=speech_condition,
+                padding_mask=padding_mask,
+                num_step=num_step,
+                guidance_scale=guidance_scale,
+                t_shift=t_shift,
+                enable_sde=enable_sde,
+                sde_noise_level=sde_noise_level,
+            )
+        else:
+            x1 = self.solver.sample(
+                x=x0,
+                text_condition=text_condition,
+                speech_condition=speech_condition,
+                padding_mask=padding_mask,
+                num_step=num_step,
+                guidance_scale=guidance_scale,
+                t_shift=t_shift,
+            )
         x1_wo_prompt_lens = (~padding_mask).sum(-1) - prompt_features_lens
         x1_prompt = torch.zeros(
             x1.size(0), prompt_features_lens.max(), x1.size(2), device=x1.device
@@ -482,8 +496,11 @@ class ZipVoice(nn.Module):
             x1_prompt[i, : prompt_features_lens[i], :] = x1[
                 i, : prompt_features_lens[i]
             ]
-
-        return x1_wo_prompt, x1_wo_prompt_lens, x1_prompt, prompt_features_lens
+        if enable_sde:
+            # TODO: support mask here
+            return x1_wo_prompt, x1_wo_prompt_lens, x1_prompt, prompt_features_lens, log_prob, prev_sample_mean, std_dev_t
+        else:
+            return x1_wo_prompt, x1_wo_prompt_lens, x1_prompt, prompt_features_lens
 
     def sample_intermediate(
         self,

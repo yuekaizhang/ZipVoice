@@ -308,7 +308,7 @@ def get_parser():
         "--dataset",
         type=str,
         default="emilia",
-        choices=["emilia", "libritts", "custom"],
+        choices=["emilia", "libritts", "custom", "aishell3"],
         help="The used training dataset",
     )
 
@@ -493,6 +493,7 @@ def train_one_epoch(
     train_dl: torch.utils.data.DataLoader,
     valid_dl: torch.utils.data.DataLoader,
     scaler: GradScaler,
+    tokenizer: "Tokenizer",
     model_avg: Optional[nn.Module] = None,
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
@@ -569,6 +570,7 @@ def train_one_epoch(
                 model=model,
                 valid_dl=valid_dl,
                 world_size=world_size,
+                tokenizer=tokenizer,
             )
             model.train()
             logging.info(
@@ -594,8 +596,11 @@ def train_one_epoch(
             device=device,
             return_tokens=True,
             return_feature=True,
+            tokenizer=tokenizer,
         )
 
+        # print batch size 
+        logging.info(f"Batch size: {batch_size}")
         try:
             with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
                 loss, loss_info = compute_fbank_loss(
@@ -726,6 +731,7 @@ def compute_validation_loss(
     model: Union[nn.Module, DDP],
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
+    tokenizer: "Tokenizer" = None,
 ) -> MetricsTracker:
     """Run the validation process."""
 
@@ -742,6 +748,7 @@ def compute_validation_loss(
             device=device,
             return_tokens=True,
             return_feature=True,
+            tokenizer=tokenizer,
         )
 
         loss, loss_info = compute_fbank_loss(
@@ -800,6 +807,7 @@ def scan_pessimistic_batches_for_oom(
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     params: AttributeDict,
+    tokenizer: "Tokenizer",
 ):
     from lhotse.dataset import find_pessimistic_batches
 
@@ -817,6 +825,7 @@ def scan_pessimistic_batches_for_oom(
             device=device,
             return_tokens=True,
             return_feature=True,
+            tokenizer=tokenizer,
         )
         try:
             with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
@@ -1013,6 +1022,11 @@ def run(rank, world_size, args):
         train_cuts = datamodule.train_libritts_cuts()
         train_cuts = train_cuts.filter(_remove_short_and_long_utt)
         dev_cuts = datamodule.dev_libritts_cuts()
+    elif params.dataset == "aishell3":
+        train_cuts = datamodule.train_cuts_aishell3()
+        train_cuts = train_cuts.filter(_remove_short_and_long_utt)
+        dev_cuts = datamodule.dev_cuts_aishell3()
+        dev_cuts = dev_cuts.filter(_remove_short_and_long_utt)
     else:
         assert params.dataset == "custom"
         train_cuts = datamodule.train_custom_cuts(params.train_manifest)
@@ -1030,8 +1044,8 @@ def run(rank, world_size, args):
                 f"will tokenize on-the-fly, which can slow down training significantly."
             )
     _tokenize_text = partial(tokenize_text, tokenizer=tokenizer)
-    train_cuts = train_cuts.map(_tokenize_text)
-    dev_cuts = dev_cuts.map(_tokenize_text)
+    # train_cuts = train_cuts.map(_tokenize_text)
+    # dev_cuts = dev_cuts.map(_tokenize_text)
 
     train_dl = datamodule.train_dataloaders(train_cuts)
 
@@ -1043,6 +1057,7 @@ def run(rank, world_size, args):
             train_dl=train_dl,
             optimizer=optimizer,
             params=params,
+            tokenizer=tokenizer,
         )
 
     logging.info("Training started")
@@ -1072,6 +1087,7 @@ def run(rank, world_size, args):
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,
+            tokenizer=tokenizer,
         )
 
         if params.num_iters > 0 and params.batch_idx_train > params.num_iters:

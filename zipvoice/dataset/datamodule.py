@@ -32,6 +32,7 @@ from lhotse.dataset import DynamicBucketingSampler, SimpleCutSampler
 from lhotse.dataset.input_strategies import OnTheFlyFeatures, PrecomputedFeatures
 from lhotse.utils import fix_random_seed
 from torch.utils.data import DataLoader
+from datasets import load_dataset
 
 from zipvoice.dataset.dataset import SpeechSynthesisDataset
 from zipvoice.utils.common import str2bool
@@ -345,3 +346,47 @@ class TtsDataModule:
         return load_manifest_lazy(
             self.args.manifest_dir / "opendialog_cuts_ZH-dev.jsonl.gz"
         )
+
+    @lru_cache()
+    def train_cuts_aishell3(self) -> CutSet:
+        logging.info("About to get train cuts")
+        # if self.args.data_dir is not None:
+        #     data_path = self.args.data_dir + "/InstructS2S-200K"
+        # else:
+        #     data_path = "yuekai/InstructS2S-200K"
+        data_path = "urarik/aishell3"
+        aishell3_train = load_dataset(
+            data_path, split="train", streaming=False
+        )
+
+        aishell3_train_cuts = CutSet.from_huggingface_dataset(
+            aishell3_train,
+            audio_key="audio",
+            text_key="sentence",
+        )
+
+        aishell3_train_cuts = aishell3_train_cuts.resample(24000)
+
+        return aishell3_train_cuts
+
+    @lru_cache()
+    def dev_cuts_aishell3(self) -> CutSet:
+        logging.info("About to get dev cuts")
+        # if self.args.data_dir is not None:
+        #     data_path = self.args.data_dir + "/InstructS2S-200K"
+        # else:
+        #     data_path = "yuekai/InstructS2S-200K"
+        data_path = "urarik/aishell3"
+        aishell3_dev = load_dataset(
+            data_path, split="test", streaming=False
+        )
+
+        aishell3_dev_cuts = CutSet.from_huggingface_dataset(
+            aishell3_dev,
+            audio_key="audio",
+            text_key="sentence",
+        )
+
+        aishell3_dev_cuts = aishell3_dev_cuts.resample(24000)
+
+        return aishell3_dev_cuts

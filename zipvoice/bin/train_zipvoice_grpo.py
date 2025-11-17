@@ -17,22 +17,17 @@
 # limitations under the License.
 
 """
-This script trains a ZipVoice model with the flow-matching loss.
+This script trains a ZipVoice model with GRPO (Generative Retraining with Policy Optimization).
+It is adapted from train_tts.py and uses a similar RL-based training loop.
 
 Usage:
 
-python3 -m zipvoice.bin.train_zipvoice \
+python3 -m zipvoice.bin.train_zipvoice_grpo \
     --world-size 8 \
     --use-fp16 1 \
-    --num-epochs 11 \
-    --max-duration 500 \
-    --lr-hours 30000 \
-    --model-config conf/zipvoice_base.json \
-    --tokenizer emilia \
-    --token-file "data/tokens_emilia.txt" \
-    --dataset emilia \
-    --manifest-dir data/fbank \
-    --exp-dir exp/zipvoice
+    --exp-dir exp/zipvoice_grpo \
+    --pretrained-model zipvoice_distill \
+    --dataset-path aishell-3-cosy.jsonl
 """
 
 import argparse
@@ -40,6 +35,9 @@ import copy
 import json
 import logging
 import os
+import random
+import time
+from concurrent import futures
 from functools import partial
 from pathlib import Path
 from shutil import copyfile
@@ -48,51 +46,194 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
-from lhotse.cut import Cut, CutSet
+import torchaudio
+import wandb
+from datasets import load_dataset
 from lhotse.utils import fix_random_seed
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
+from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.tensorboard import SummaryWriter
+from tqdm.auto import tqdm
 
-import zipvoice.utils.diagnostics as diagnostics
-from zipvoice.dataset.datamodule import TtsDataModule
-from zipvoice.models.zipvoice import ZipVoice
-from zipvoice.tokenizer.tokenizer import (
-    EmiliaTokenizer,
-    EspeakTokenizer,
-    LibriTTSTokenizer,
-    SimpleTokenizer,
-)
+from pipeline_zipvoice import ZipVoicePipeline
+from zipvoice.models.modules.solver import sde_step_with_logprob
 from zipvoice.utils.checkpoint import (
     load_checkpoint,
     remove_checkpoints,
     resume_checkpoint,
     save_checkpoint,
     save_checkpoint_with_global_batch_idx,
-    update_averaged_model,
 )
 from zipvoice.utils.common import (
     AttributeDict,
     GradScaler,
-    MetricsTracker,
     cleanup_dist,
     create_grad_scaler,
-    get_adjusted_batch_count,
     get_env_info,
-    get_parameter_groups_with_lrs,
-    prepare_input,
-    set_batch_count,
     setup_dist,
     setup_logger,
     str2bool,
     torch_autocast,
 )
-from zipvoice.utils.hooks import register_inf_check_hooks
-from zipvoice.utils.lr_scheduler import Eden, FixedLRScheduler, LRScheduler
-from zipvoice.utils.optim import ScaledAdam
 
-LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, LRScheduler]
+tqdm = partial(tqdm, dynamic_ncols=True)
+
+
+class DistributedKRepeatSampler(Sampler):
+    def __init__(self, dataset, batch_size, k, num_replicas, rank, seed=0):
+        self.dataset = dataset
+        self.batch_size = batch_size  # Batch size per replica
+        self.k = k  # Number of repetitions per sample
+        self.num_replicas = num_replicas  # Total number of replicas
+        self.rank = rank  # Current replica rank
+        self.seed = seed  # Random seed for synchronization
+
+        self.total_samples = self.num_replicas * self.batch_size
+        assert (
+            self.total_samples % self.k == 0
+        ), f"k can not divide n*b, k{k}-num_replicas{num_replicas}-batch_size{batch_size}"
+        self.m = self.total_samples // self.k  # Number of unique samples
+        self.epoch = 0
+
+    def __iter__(self):
+        while True:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+
+            indices = torch.randperm(len(self.dataset), generator=g)[: self.m].tolist()
+
+            repeated_indices = [idx for idx in indices for _ in range(self.k)]
+
+            shuffled_indices = torch.randperm(
+                len(repeated_indices), generator=g
+            ).tolist()
+            shuffled_samples = [repeated_indices[i] for i in shuffled_indices]
+
+            per_card_samples = []
+            for i in range(self.num_replicas):
+                start = i * self.batch_size
+                end = start + self.batch_size
+                per_card_samples.append(shuffled_samples[start:end])
+
+            yield per_card_samples[self.rank]
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+
+class SpeechPromptDataset(Dataset):
+    def __init__(
+        self,
+        target_text_path,
+        split="train",
+        prompt_dataset_name="yuekai/aishell",
+        prompt_dataset_split="test",
+    ):
+        # Load target texts
+        self.target_texts = []
+        if target_text_path.endswith(".jsonl"):
+            with open(target_text_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    self.target_texts.append(json.loads(line)["text"])
+        elif target_text_path.endswith(".txt"):
+            with open(target_text_path, "r", encoding="utf-8") as f:
+                self.target_texts = [line.strip() for line in f.readlines()]
+        else:
+            raise FileNotFoundError(f"Neither {target_text_path} found.")
+
+        # Load prompt dataset
+        self.prompt_dataset = load_dataset(
+            "yuekai/aishell", "test", trust_remote_code=True
+        )["test"]
+
+    def __len__(self):
+        return len(self.target_texts)
+
+    def _get_random_prompt(self):
+        random_idx = random.randint(0, len(self.prompt_dataset) - 1)
+        sample = self.prompt_dataset[random_idx]
+
+        prompt_text = sample["text"].replace(" ", "")
+
+        audio_data = sample["audio"]
+        # The audio array is already a numpy array, convert it to a tensor.
+        audio_array = torch.from_numpy(audio_data["array"]).float()
+        sample_rate = audio_data["sampling_rate"]
+
+        return prompt_text, audio_array, sample_rate
+
+    def __getitem__(self, idx):
+        target_text = self.target_texts[idx]
+        prompt_text, prompt_wav, prompt_sampling_rate = self._get_random_prompt()
+
+        item = {
+            "id": f"item_{idx}",
+            "prompt_wav": prompt_wav,
+            "prompt_sampling_rate": prompt_sampling_rate,
+            "prompt_text": prompt_text,
+            "target_text": target_text,
+        }
+        return item
+
+    @staticmethod
+    def collate_fn(batch):
+        target_sampling_rate = 24000
+        ids, prompt_wavs_list, prompt_texts_list, target_texts_list = [], [], [], []
+
+        for item in batch:
+            prompt_wav = item["prompt_wav"]
+            prompt_sampling_rate = item["prompt_sampling_rate"]
+
+            if prompt_sampling_rate != target_sampling_rate:
+                resampler = torchaudio.transforms.Resample(
+                    orig_freq=prompt_sampling_rate,
+                    new_freq=target_sampling_rate,
+                )
+                prompt_wav = resampler(prompt_wav)
+
+            prompt_wavs_list.append(prompt_wav)
+            prompt_texts_list.append(item["prompt_text"])
+            target_texts_list.append(item["target_text"])
+            ids.append(item["id"])
+
+        return ids, prompt_wavs_list, prompt_texts_list, target_texts_list
+
+
+def compute_log_prob(model, pipeline, sample, j, params):
+    """
+    Computes the log probability of the next latent state given the current latent state.
+    """
+    latents = sample["latents"][:, j]
+    timesteps = sample["timesteps"]
+    step_index = (timesteps[0] == timesteps[:, j][0]).nonzero().item()
+
+    current_t = timesteps[:, step_index]
+    next_t = timesteps[:, step_index + 1]
+
+    # Predict the velocity
+    v = model.forward_fm_decoder(
+        t=current_t,
+        xt=latents,
+        text_condition=sample["text_condition"],
+        speech_condition=sample["speech_condition"],
+        padding_mask=sample["padding_mask"],
+        guidance_scale=params.guidance_scale,
+    )
+
+    # Compute the log prob of next_latents given latents under the current model
+    _, log_prob, _, _ = sde_step_with_logprob(
+        v,
+        sigma_prev=next_t,
+        sigma=current_t,
+        sample=latents,
+        prev_sample=sample["next_latents"][:, j],
+        noise_level=params.noise_level,
+        sde_type="cps",  # Make sure this matches the one used in sampling
+    )
+
+    return log_prob
 
 
 def get_parser():
@@ -122,91 +263,17 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--num-epochs",
-        type=int,
-        default=11,
-        help="Number of epochs to train.",
-    )
-
-    parser.add_argument(
-        "--num-iters",
-        type=int,
-        default=0,
-        help="Number of iter to train, will ignore num_epochs if > 0.",
-    )
-
-    parser.add_argument(
         "--start-epoch",
         type=int,
         default=1,
-        help="""Resume training from this epoch. It should be positive.
-        If larger than 1, it will load checkpoint from
-        exp-dir/epoch-{start_epoch-1}.pt
-        """,
-    )
-
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="""Checkpoints of pre-trained models, will load it if not None
-        """,
+        help="""Resume training from this epoch.""",
     )
 
     parser.add_argument(
         "--exp-dir",
         type=str,
-        default="exp/zipvoice",
-        help="""The experiment dir.
-        It specifies the directory where all training related
-        files, e.g., checkpoints, log, etc, are saved
-        """,
-    )
-
-    parser.add_argument(
-        "--base-lr", type=float, default=0.02, help="The base learning rate."
-    )
-
-    parser.add_argument(
-        "--lr-batches",
-        type=float,
-        default=7500,
-        help="""Number of steps that affects how rapidly the learning rate
-        decreases. We suggest not to change this.""",
-    )
-
-    parser.add_argument(
-        "--lr-epochs",
-        type=float,
-        default=10,
-        help="""Number of epochs that affects how rapidly the learning rate decreases.
-        """,
-    )
-
-    parser.add_argument(
-        "--lr-hours",
-        type=float,
-        default=0,
-        help="""If positive, --epoch is ignored and it specifies the number of hours
-        that affects how rapidly the learning rate decreases.
-        """,
-    )
-
-    parser.add_argument(
-        "--ref-duration",
-        type=float,
-        default=50,
-        help="""Reference batch duration for purposes of adjusting batch counts for"
-        setting various schedules inside the model".
-        """,
-    )
-
-    parser.add_argument(
-        "--finetune",
-        type=str2bool,
-        default=False,
-        help="Whether to use the fine-tuning mode, will used a fixed learning rate "
-        "schedule and skip the large dropout phase.",
+        default="exp/zipvoice_grpo",
+        help="""The experiment dir.""",
     )
 
     parser.add_argument(
@@ -215,655 +282,319 @@ def get_parser():
         default=42,
         help="The seed for random generators intended for reproducibility",
     )
-
+    # New arguments from train_tts.py config
+    parser.add_argument("--run-name", type=str, default="tts_rl_8gpu")
+    parser.add_argument("--logdir", type=str, default="logs")
+    parser.add_argument("--save-freq", type=int, default=20)
+    parser.add_argument("--num-checkpoint-limit", type=int, default=5)
     parser.add_argument(
-        "--print-diagnostics",
-        type=str2bool,
-        default=False,
-        help="Accumulate stats on activations, print them and exit.",
+        "--mixed-precision", type=str, default="fp16", choices=["fp16", "bf16", "no"]
     )
-
-    parser.add_argument(
-        "--scan-oom",
-        type=str2bool,
-        default=False,
-        help="Scan pessimistic batches to see whether they cause OOMs.",
-    )
-
-    parser.add_argument(
-        "--inf-check",
-        type=str2bool,
-        default=False,
-        help="Add hooks to check for infinite module outputs and gradients.",
-    )
-
-    parser.add_argument(
-        "--save-every-n",
-        type=int,
-        default=5000,
-        help="""Save checkpoint after processing this number of batches"
-        periodically. We save checkpoint to exp-dir/ whenever
-        params.batch_idx_train % save_every_n == 0. The checkpoint filename
-        has the form: f'exp-dir/checkpoint-{params.batch_idx_train}.pt'
-        Note: It also saves checkpoint to `exp-dir/epoch-xxx.pt` at the
-        end of each epoch where `xxx` is the epoch number counting from 1.
-        """,
-    )
-
-    parser.add_argument(
-        "--valid-by-epoch",
-        type=str2bool,
-        default=False,
-        help="""Whether to validate after each epoch. If False, will validate 
-        after every save_every_n iterations.
-        """,
-    )
-
-    parser.add_argument(
-        "--keep-last-k",
-        type=int,
-        default=30,
-        help="""Only keep this number of checkpoints on disk.
-        For instance, if it is 3, there are only 3 checkpoints
-        in the exp-dir with filenames `checkpoint-xxx.pt`.
-        It does not affect checkpoints with name `epoch-xxx.pt`.
-        """,
-    )
-
-    parser.add_argument(
-        "--average-period",
-        type=int,
-        default=200,
-        help="""Update the averaged model, namely `model_avg`, after processing
-        this number of batches. `model_avg` is a separate version of model,
-        in which each floating-point parameter is the average of all the
-        parameters from the start of training. Each time we take the average,
-        we do: `model_avg = model * (average_period / batch_idx_train) +
-            model_avg * ((batch_idx_train - average_period) / batch_idx_train)`.
-        """,
-    )
-
+    parser.add_argument("--dataset-path", type=str, default="aishell-3-cosy.jsonl")
+    parser.add_argument("--pretrained-model", type=str, default="zipvoice_distill")
+    parser.add_argument("--num-steps", type=int, default=16)
+    parser.add_argument("--guidance-scale", type=float, default=3.0)
+    parser.add_argument("--train-batch-size", type=int, default=4)
+    parser.add_argument("--num-audio-per-prompt", type=int, default=4)
+    parser.add_argument("--num-batches-per-epoch", type=int, default=8)
+    parser.add_argument("--noise-level", type=float, default=0.2)
+    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--adam-beta1", type=float, default=0.9)
+    parser.add_argument("--adam-beta2", type=float, default=0.999)
+    parser.add_argument("--adam-weight-decay", type=float, default=1e-4)
+    parser.add_argument("--adam-epsilon", type=float, default=1e-8)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--num-inner-epochs", type=int, default=1)
+    parser.add_argument("--adv-clip-max", type=float, default=5)
+    parser.add_argument("--clip-range", type=float, default=1e-4)
     parser.add_argument(
         "--use-fp16",
         type=str2bool,
         default=True,
         help="Whether to use half precision training.",
     )
-
     parser.add_argument(
-        "--feat-scale",
-        type=float,
-        default=0.1,
-        help="The scale factor of fbank feature",
+        "--save-every-n",
+        type=int,
+        default=5000,
+        help="Save checkpoint after processing this number of batches",
     )
-
     parser.add_argument(
-        "--condition-drop-ratio",
-        type=float,
-        default=0.2,
-        help="The drop rate of text condition during training.",
-    )
-
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="emilia",
-        choices=["emilia", "libritts", "custom", "aishell3"],
-        help="The used training dataset",
-    )
-
-    parser.add_argument(
-        "--train-manifest",
-        type=str,
-        help="Path of the training manifest",
-    )
-
-    parser.add_argument(
-        "--dev-manifest",
-        type=str,
-        help="Path of the validation manifest",
-    )
-
-    parser.add_argument(
-        "--min-len",
-        type=float,
-        default=1.0,
-        help="The minimum audio length used for training",
-    )
-
-    parser.add_argument(
-        "--max-len",
-        type=float,
-        default=30.0,
-        help="The maximum audio length used for training",
-    )
-
-    parser.add_argument(
-        "--model-config",
-        type=str,
-        default="conf/zipvoice_base.json",
-        help="The model configuration file.",
-    )
-
-    parser.add_argument(
-        "--tokenizer",
-        type=str,
-        default="emilia",
-        choices=["emilia", "libritts", "espeak", "simple"],
-        help="Tokenizer type.",
-    )
-
-    parser.add_argument(
-        "--lang",
-        type=str,
-        default="en-us",
-        help="Language identifier, used when tokenizer type is espeak. see"
-        "https://github.com/rhasspy/espeak-ng/blob/master/docs/languages.md",
-    )
-
-    parser.add_argument(
-        "--token-file",
-        type=str,
-        default="data/tokens_emilia.txt",
-        help="The file that contains information that maps tokens to ids,"
-        "which is a text file with '{token}\t{token_id}' per line.",
+        "--keep-last-k",
+        type=int,
+        default=30,
+        help="""Only keep this number of checkpoints on disk.""",
     )
 
     return parser
 
 
-def get_params() -> AttributeDict:
-    """Return a dict containing training parameters.
+def train(params: AttributeDict, rank: int, world_size: int):
+    """The main training loop."""
+    device = torch.device("cuda", rank)
+    fix_random_seed(params.seed)
 
-    All training related parameters that are not passed from the commandline
-    are saved in the variable `params`.
+    # Setup logging
+    if rank == 0:
+        wandb.init(project="flow_grpo_tts", name=params.run_name)
+    logging.info(f"\n{params}")
 
-    Commandline options are merged into `params` after they are parsed, so
-    you can also access them via `params`.
+    # Load TTS model via pipeline
+    pipeline = ZipVoicePipeline(model_name=params.pretrained_model, device=device)
+    model = pipeline.model
 
-    Explanation of options saved in `params`:
+    # For now, we train the full model.
+    model_parameters = list(model.parameters())
 
-        - best_train_loss: Best training loss so far. It is used to select
-                           the model that has the lowest training loss. It is
-                           updated during the training.
+    # DDP
+    if world_size > 1:
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
-        - best_valid_loss: Best validation loss so far. It is used to select
-                           the model that has the lowest validation loss. It is
-                           updated during the training.
-
-        - best_train_epoch: It is the epoch that has the best training loss.
-
-        - best_valid_epoch: It is the epoch that has the best validation loss.
-
-        - batch_idx_train: Used to writing statistics to tensorboard. It
-                           contains number of batches trained so far across
-                           epochs.
-
-        - log_interval:  Print training loss if batch_idx % log_interval` is 0
-
-        - reset_interval: Reset statistics if batch_idx % reset_interval is 0
-
-        - env_info:  A dict containing information about the environment.
-
-    """
-    params = AttributeDict(
-        {
-            "best_train_loss": float("inf"),
-            "best_valid_loss": float("inf"),
-            "best_train_epoch": -1,
-            "best_valid_epoch": -1,
-            "batch_idx_train": 0,
-            "log_interval": 50,
-            "reset_interval": 200,
-            "env_info": get_env_info(),
-        }
+    # Initialize the optimizer
+    optimizer = torch.optim.AdamW(
+        model_parameters,
+        lr=params.learning_rate,
+        betas=(params.adam_beta1, params.adam_beta2),
+        weight_decay=params.adam_weight_decay,
+        eps=params.adam_epsilon,
     )
 
-    return params
+    # Dataset and Dataloader
+    train_dataset = SpeechPromptDataset(target_text_path=params.dataset_path)
+    train_sampler = DistributedKRepeatSampler(
+        dataset=train_dataset,
+        batch_size=params.train_batch_size,
+        k=params.num_audio_per_prompt,
+        num_replicas=world_size,
+        rank=rank,
+        seed=params.seed,
+    )
 
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_sampler=train_sampler,
+        num_workers=1,
+        collate_fn=SpeechPromptDataset.collate_fn,
+    )
 
-def compute_fbank_loss(
-    params: AttributeDict,
-    model: Union[nn.Module, DDP],
-    features: Tensor,
-    features_lens: Tensor,
-    tokens: List[List[int]],
-    is_training: bool,
-) -> Tuple[Tensor, MetricsTracker]:
-    """
-    Compute loss given the model and its inputs.
+    scaler = create_grad_scaler(enabled=params.use_fp16)
 
-    Args:
-      params:
-        Parameters for training. See :func:`get_params`.
-      model:
-        The model for training.
-      features:
-        The target acoustic feature.
-      features_lens:
-        The number of frames of each utterance.
-      tokens:
-        Input tokens that representing the transcripts.
-      is_training:
-        True for training. False for validation. When it is True, this
-        function enables autograd during computation; when it is False, it
-        disables autograd.
-    """
+    # Placeholder reward function
+    def placeholder_reward_fn(wavs, texts, metadata):
+        rewards = {"placeholder_reward": [random.random() for _ in wavs]}
+        return rewards, {}
 
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
+    reward_fn = placeholder_reward_fn
 
-    batch_size, num_frames, _ = features.shape
+    executor = futures.ThreadPoolExecutor(max_workers=2)
+    autocast = partial(torch_autocast, dtype=torch.float16, enabled=params.use_fp16)
 
-    noise = torch.randn_like(features)  # (B, T, F)
+    logging.info("***** Running training *****")
 
-    # Sampling t from uniform distribution
-    if is_training:
-        t = torch.rand(batch_size, 1, 1, device=device)
-    else:
-        t = (
-            (torch.arange(batch_size, device=device) / batch_size)
-            .unsqueeze(1)
-            .unsqueeze(2)
-        )
-    with torch.set_grad_enabled(is_training):
+    epoch = 0
+    global_step = 0
+    train_iter = iter(train_dataloader)
+    num_train_timesteps = params.num_steps
 
-        loss = model(
-            tokens=tokens,
-            features=features,
-            features_lens=features_lens,
-            noise=noise,
-            t=t,
-            condition_drop_ratio=params.condition_drop_ratio,
-        )
+    while True:
+        #################### SAMPLING ####################
+        if isinstance(model, DDP):
+            model.module.eval()
+        else:
+            model.eval()
 
-    assert loss.requires_grad == is_training
-    info = MetricsTracker()
-    num_frames = features_lens.sum().item()
-    info["frames"] = num_frames
-    info["loss"] = loss.detach().cpu().item() * num_frames
-
-    return loss, info
-
-
-def train_one_epoch(
-    params: AttributeDict,
-    model: Union[nn.Module, DDP],
-    optimizer: Optimizer,
-    scheduler: LRSchedulerType,
-    train_dl: torch.utils.data.DataLoader,
-    valid_dl: torch.utils.data.DataLoader,
-    scaler: GradScaler,
-    tokenizer: "Tokenizer",
-    model_avg: Optional[nn.Module] = None,
-    tb_writer: Optional[SummaryWriter] = None,
-    world_size: int = 1,
-    rank: int = 0,
-) -> None:
-    """Train the model for one epoch.
-
-    The training loss from the mean of all frames is saved in
-    `params.train_loss`. It runs the validation process every
-    `params.valid_interval` batches or every epochs.
-
-    Args:
-      params:
-        It is returned by :func:`get_params`.
-      model:
-        The model for training.
-      optimizer:
-        The optimizer.
-      scheduler:
-        The learning rate scheduler, we call step() every epoch.
-      train_dl:
-        Dataloader for the training dataset.
-      valid_dl:
-        Dataloader for the validation dataset.
-      scaler:
-        The scaler used for mix precision training.
-      tb_writer:
-        Writer to write log messages to tensorboard.
-      world_size:
-        Number of nodes in DDP training. If it is 1, DDP is disabled.
-      rank:
-        The rank of the node in DDP training. If no DDP is used, it should
-        be set to 0.
-    """
-    model.train()
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
-
-    # used to track the stats over iterations in one epoch
-    tot_loss = MetricsTracker()
-
-    saved_bad_model = False
-
-    def save_bad_model(suffix: str = ""):
-        save_checkpoint(
-            filename=params.exp_dir / f"bad-model{suffix}-{rank}.pt",
-            model=model,
-            model_avg=model_avg,
-            params=params,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            sampler=train_dl.sampler,
-            scaler=scaler,
-            rank=0,
-        )
-
-    for batch_idx, batch in enumerate(train_dl):
-
-        if batch_idx % 10 == 0:
-            if params.finetune:
-                set_batch_count(model, get_adjusted_batch_count(params) + 100000)
-            else:
-                set_batch_count(model, get_adjusted_batch_count(params))
-
-        if (
-            params.valid_by_epoch and batch_idx == 0 and not params.print_diagnostics
-        ) or (
-            not params.valid_by_epoch
-            and params.batch_idx_train % params.valid_interval == 0
-            and not params.print_diagnostics
+        samples = []
+        for i in tqdm(
+            range(params.num_batches_per_epoch),
+            desc=f"Epoch {epoch}: sampling",
+            disable=rank != 0,
+            position=0,
         ):
-            logging.info("Computing validation loss")
-            valid_info = compute_validation_loss(
-                params=params,
-                model=model,
-                valid_dl=valid_dl,
-                world_size=world_size,
-                tokenizer=tokenizer,
+            ids, prompt_wavs_list, prompt_texts_list, target_texts_list = next(
+                train_iter
             )
-            model.train()
-            logging.info(
-                f"Epoch {params.cur_epoch}, global_batch_idx: {params.batch_idx_train},"
-                f" validation: {valid_info}"
+
+            with torch.no_grad():
+                with autocast():
+                    audios, latents, log_probs, timesteps = pipeline(
+                        prompt_text=prompt_texts_list,
+                        prompt_wav=prompt_wavs_list,
+                        text=target_texts_list,
+                        num_step=num_train_timesteps,
+                        guidance_scale=params.guidance_scale,
+                        enable_sde=True,
+                        sde_noise_level=params.noise_level,
+                    )
+
+            latents = torch.stack(latents, dim=1)
+            log_probs = torch.stack(log_probs, dim=1)
+            timesteps = timesteps.unsqueeze(0).repeat(latents.size(0), 1)
+
+            # Recompute conditions for training
+            prepared_inputs = pipeline.prepare_latents(
+                prompt_text=prompt_texts_list,
+                prompt_wav=prompt_wavs_list,
+                text=target_texts_list,
             )
-            logging.info(
-                f"Maximum memory allocated so far is "
-                f"{torch.cuda.max_memory_allocated() // 1000000}MB"
+            unwrapped_model = model.module if isinstance(model, DDP) else model
+            text_condition, padding_mask = (
+                unwrapped_model.forward_text_inference_ratio_duration(
+                    tokens=prepared_inputs["tokens"],
+                    prompt_tokens=prepared_inputs["prompt_tokens"],
+                    prompt_features_lens=prepared_inputs["prompt_features_lens"],
+                    speed=1.0,
+                )
             )
-            if tb_writer is not None:
-                valid_info.write_summary(
-                    tb_writer, "train/valid_", params.batch_idx_train
-                )
 
-        params.batch_idx_train += 1
+            num_frames = text_condition.shape[1]
+            prompt_features = prepared_inputs["prompt_features"]
+            speech_condition = torch.nn.functional.pad(
+                prompt_features, (0, 0, 0, num_frames - prompt_features.size(1))
+            )
 
-        batch_size = len(batch["text"])
+            rewards_future = executor.submit(reward_fn, audios, target_texts_list, {})
 
-        tokens, features, features_lens = prepare_input(
-            params=params,
-            batch=batch,
-            device=device,
-            return_tokens=True,
-            return_feature=True,
-            tokenizer=tokenizer,
-        )
+            samples.append(
+                {
+                    "latents": latents[:, :-1],
+                    "next_latents": latents[:, 1:],
+                    "log_probs": log_probs,
+                    "timesteps": timesteps,
+                    "text_condition": text_condition,
+                    "speech_condition": speech_condition,
+                    "padding_mask": padding_mask,
+                    "rewards": rewards_future,
+                }
+            )
 
-        # print batch size 
-        logging.info(f"Batch size: {batch_size}")
-        try:
-            with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
-                loss, loss_info = compute_fbank_loss(
-                    params=params,
-                    model=model,
-                    features=features,
-                    features_lens=features_lens,
-                    tokens=tokens,
-                    is_training=True,
-                )
+        for sample in tqdm(samples, desc="Waiting for rewards", disable=rank != 0):
+            rewards, _ = sample["rewards"].result()
+            sample["rewards"] = {
+                k: torch.as_tensor(v, device=device).float()
+                for k, v in rewards.items()
+            }
 
-            tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
+        rewards_cat = {
+            key: torch.cat([s["rewards"][key] for s in samples])
+            for key in samples[0]["rewards"]
+        }
+        samples_cat = {
+            key: torch.cat([s[key] for s in samples])
+            for key in samples[0]
+            if key != "rewards"
+        }
+        samples_cat["rewards"] = rewards_cat
+        samples = samples_cat
 
-            scaler.scale(loss).backward()
+        # Advantage calculation with global stats
+        local_rewards = samples["rewards"]["placeholder_reward"]
+        if world_size > 1:
+            # Gather rewards from all GPUs
+            local_size = torch.tensor([local_rewards.size(0)], device=device)
+            all_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
+            torch.distributed.all_gather(all_sizes, local_size)
+            max_size = max(s.item() for s in all_sizes)
 
-            scheduler.step_batch(params.batch_idx_train)
-            # Use the number of hours of speech to adjust the learning rate
-            if params.lr_hours > 0:
-                scheduler.step_epoch(
-                    params.batch_idx_train
-                    * params.max_duration
-                    * params.world_size
-                    / 3600
-                )
+            padded_rewards = torch.zeros(max_size, device=device)
+            padded_rewards[: local_rewards.size(0)] = local_rewards
+            
+            all_rewards_padded = [torch.zeros_like(padded_rewards) for _ in range(world_size)]
+            torch.distributed.all_gather(all_rewards_padded, padded_rewards)
+
+            # Unpad and concatenate
+            all_rewards = []
+            for i in range(world_size):
+                all_rewards.append(all_rewards_padded[i][:all_sizes[i].item()])
+            
+            all_rewards_tensor = torch.cat(all_rewards)
+            mean = all_rewards_tensor.mean()
+            std = all_rewards_tensor.std() + 1e-8
+        else:
+            mean = local_rewards.mean()
+            std = local_rewards.std() + 1e-8
+        
+        advantages = (local_rewards - mean) / std
+        samples["advantages"] = advantages.unsqueeze(1).repeat(1, num_train_timesteps)
+
+        del samples["rewards"]
+
+        #################### TRAINING ####################
+        for inner_epoch in range(params.num_inner_epochs):
+            if isinstance(model, DDP):
+                model.module.train()
+            else:
+                model.train()
+            
+            optimizer.zero_grad()
+            
+            for j in tqdm(
+                range(num_train_timesteps),
+                desc=f"Epoch {epoch}.{inner_epoch}: training",
+                disable=rank != 0,
+            ):
+                with autocast():
+                    unwrapped_model = model.module if isinstance(model, DDP) else model
+                    log_prob = compute_log_prob(
+                        unwrapped_model, pipeline, samples, j, params
+                    )
+
+                    advantages = torch.clamp(
+                        samples["advantages"][:, j],
+                        -params.adv_clip_max,
+                        params.adv_clip_max,
+                    )
+                    ratio = torch.exp(log_prob - samples["log_probs"][:, j])
+
+                    unclipped_loss = -advantages * ratio
+                    clipped_loss = -advantages * torch.clamp(
+                        ratio,
+                        1.0 - params.clip_range,
+                        1.0 + params.clip_range,
+                    )
+                    loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+                    # Normalize loss by number of timesteps for accumulation
+                    loss = loss / num_train_timesteps
+
+                scaler.scale(loss).backward()
+            
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), params.max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
-        except Exception as e:
-            logging.info(f"Caught exception : {e}.")
-            save_bad_model()
-            raise
 
-        if params.print_diagnostics and batch_idx == 5:
-            return
-
-        if (
-            rank == 0
-            and params.batch_idx_train > 0
-            and params.batch_idx_train % params.average_period == 0
-        ):
-            update_averaged_model(
+            # Logging
+            if rank == 0:
+                wandb.log(
+                    {
+                        "loss": loss.item() * num_train_timesteps, # Log unnormalized loss
+                        "epoch": epoch,
+                        "inner_epoch": inner_epoch,
+                    },
+                    step=global_step,
+                )
+            global_step += 1
+        
+        # Checkpointing
+        if epoch > 0 and epoch % params.save_freq == 0:
+            filename = params.exp_dir / f"epoch-{epoch}.pt"
+            save_checkpoint(
+                filename=filename,
                 params=params,
-                model_cur=model,
-                model_avg=model_avg,
-            )
-
-        if (
-            params.batch_idx_train > 0
-            and params.batch_idx_train % params.save_every_n == 0
-        ):
-            save_checkpoint_with_global_batch_idx(
-                out_dir=params.exp_dir,
-                global_batch_idx=params.batch_idx_train,
                 model=model,
-                model_avg=model_avg,
-                params=params,
                 optimizer=optimizer,
-                scheduler=scheduler,
-                sampler=train_dl.sampler,
                 scaler=scaler,
                 rank=rank,
             )
             remove_checkpoints(
                 out_dir=params.exp_dir,
-                topk=params.keep_last_k,
+                topk=params.num_checkpoint_limit,
                 rank=rank,
-            )
-        if params.num_iters > 0 and params.batch_idx_train > params.num_iters:
-            break
-        if params.batch_idx_train % 100 == 0 and params.use_fp16:
-            # If the grad scale was less than 1, try increasing it. The _growth_interval
-            # of the grad scaler is configurable, but we can't configure it to have
-            # different behavior depending on the current grad scale.
-            cur_grad_scale = scaler._scale.item()
-
-            if cur_grad_scale < 1024.0 or (
-                cur_grad_scale < 4096.0 and params.batch_idx_train % 400 == 0
-            ):
-                scaler.update(cur_grad_scale * 2.0)
-            if cur_grad_scale < 0.01:
-                if not saved_bad_model:
-                    save_bad_model(suffix="-first-warning")
-                    saved_bad_model = True
-                logging.warning(f"Grad scale is small: {cur_grad_scale}")
-            if cur_grad_scale < 1.0e-05:
-                save_bad_model()
-                raise RuntimeError(
-                    f"grad_scale is too small, exiting: {cur_grad_scale}"
-                )
-
-        if params.batch_idx_train % params.log_interval == 0:
-            cur_lr = max(scheduler.get_last_lr())
-            cur_grad_scale = scaler._scale.item() if params.use_fp16 else 1.0
-
-            logging.info(
-                f"Epoch {params.cur_epoch}, batch {batch_idx}, "
-                f"global_batch_idx: {params.batch_idx_train}, "
-                f"batch size: {batch_size}, "
-                f"loss[{loss_info}], tot_loss[{tot_loss}], "
-                f"cur_lr: {cur_lr:.2e}, "
-                + (f"grad_scale: {scaler._scale.item()}" if params.use_fp16 else "")
+                prefix="epoch-"
             )
 
-            if tb_writer is not None:
-                tb_writer.add_scalar(
-                    "train/learning_rate", cur_lr, params.batch_idx_train
-                )
-                loss_info.write_summary(
-                    tb_writer, "train/current_", params.batch_idx_train
-                )
-                tot_loss.write_summary(tb_writer, "train/tot_", params.batch_idx_train)
-                if params.use_fp16:
-                    tb_writer.add_scalar(
-                        "train/grad_scale",
-                        cur_grad_scale,
-                        params.batch_idx_train,
-                    )
 
-    loss_value = tot_loss["loss"]
-    params.train_loss = loss_value
-    if params.train_loss < params.best_train_loss:
-        params.best_train_epoch = params.cur_epoch
-        params.best_train_loss = params.train_loss
-
-
-def compute_validation_loss(
-    params: AttributeDict,
-    model: Union[nn.Module, DDP],
-    valid_dl: torch.utils.data.DataLoader,
-    world_size: int = 1,
-    tokenizer: "Tokenizer" = None,
-) -> MetricsTracker:
-    """Run the validation process."""
-
-    model.eval()
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
-
-    # used to summary the stats over iterations
-    tot_loss = MetricsTracker()
-
-    for batch_idx, batch in enumerate(valid_dl):
-        tokens, features, features_lens = prepare_input(
-            params=params,
-            batch=batch,
-            device=device,
-            return_tokens=True,
-            return_feature=True,
-            tokenizer=tokenizer,
-        )
-
-        loss, loss_info = compute_fbank_loss(
-            params=params,
-            model=model,
-            features=features,
-            features_lens=features_lens,
-            tokens=tokens,
-            is_training=False,
-        )
-        assert loss.requires_grad is False
-        tot_loss = tot_loss + loss_info
-
-    if world_size > 1:
-        tot_loss.reduce(loss.device)
-
-    loss_value = tot_loss["loss"]
-    if loss_value < params.best_valid_loss:
-        params.best_valid_epoch = params.cur_epoch
-        params.best_valid_loss = loss_value
-
-    return tot_loss
-
-
-def display_and_save_batch(
-    batch: dict,
-    params: AttributeDict,
-) -> None:
-    """Display the batch statistics and save the batch into disk.
-
-    Args:
-      batch:
-        A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
-        for the content in it.
-      params:
-        Parameters for training. See :func:`get_params`.
-      sp:
-        The BPE model.
-    """
-    from lhotse.utils import uuid4
-
-    filename = f"{params.exp_dir}/batch-{uuid4()}.pt"
-    logging.info(f"Saving batch to {filename}")
-    torch.save(batch, filename)
-
-    features = batch["features"]
-    tokens = batch["tokens"]
-
-    logging.info(f"features shape: {features.shape}")
-    num_tokens = sum(len(i) for i in tokens)
-    logging.info(f"num tokens: {num_tokens}")
-
-
-def scan_pessimistic_batches_for_oom(
-    model: Union[nn.Module, DDP],
-    train_dl: torch.utils.data.DataLoader,
-    optimizer: torch.optim.Optimizer,
-    params: AttributeDict,
-    tokenizer: "Tokenizer",
-):
-    from lhotse.dataset import find_pessimistic_batches
-
-    logging.info(
-        "Sanity check -- see if any of the batches in epoch 1 would cause OOM."
-    )
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
-
-    batches, crit_values = find_pessimistic_batches(train_dl.sampler)
-    for criterion, cuts in batches.items():
-        batch = train_dl.dataset[cuts]
-        tokens, features, features_lens = prepare_input(
-            params=params,
-            batch=batch,
-            device=device,
-            return_tokens=True,
-            return_feature=True,
-            tokenizer=tokenizer,
-        )
-        try:
-            with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
-
-                loss, loss_info = compute_fbank_loss(
-                    params=params,
-                    model=model,
-                    features=features,
-                    features_lens=features_lens,
-                    tokens=tokens,
-                    is_training=True,
-                )
-            loss.backward()
-            optimizer.zero_grad()
-        except Exception as e:
-            if "CUDA out of memory" in str(e):
-                logging.error(
-                    "Your GPU ran out of memory with the current "
-                    "max_duration setting. We recommend decreasing "
-                    "max_duration and trying again.\n"
-                    f"Failing criterion: {criterion} "
-                    f"(={crit_values[criterion]}) ..."
-                )
-            display_and_save_batch(batch, params=params)
-            raise
-        logging.info(
-            f"Maximum memory allocated so far is "
-            f"{torch.cuda.max_memory_allocated() // 1000000}MB"
-        )
-
-
-def tokenize_text(c: Cut, tokenizer):
-    if hasattr(c.supervisions[0], "tokens"):
-        tokens = tokenizer.tokens_to_token_ids([c.supervisions[0].tokens])
-    else:
-        tokens = tokenizer.texts_to_token_ids([c.supervisions[0].text])
-    c.supervisions[0].tokens = tokens[0]
-    return c
+        epoch += 1
 
 
 def run(rank, world_size, args):
@@ -878,248 +609,19 @@ def run(rank, world_size, args):
       args:
         The return value of get_parser().parse_args()
     """
-    params = get_params()
-    params.update(vars(args))
-    params.valid_interval = params.save_every_n
-    # Set epoch to a large number to ignore it.
-    if params.num_iters > 0:
-        params.num_epochs = 1000000
-    with open(params.model_config, "r") as f:
-        model_config = json.load(f)
-    params.update(model_config["model"])
-    params.update(model_config["feature"])
+    params = AttributeDict(vars(args))
 
-    fix_random_seed(params.seed)
     if world_size > 1:
         setup_dist(rank, world_size, params.master_port)
 
-    os.makedirs(f"{params.exp_dir}", exist_ok=True)
-    copyfile(src=params.model_config, dst=f"{params.exp_dir}/model.json")
-    copyfile(src=params.token_file, dst=f"{params.exp_dir}/tokens.txt")
+    os.makedirs(f"{params.exp_dir}/log", exist_ok=True)
     setup_logger(f"{params.exp_dir}/log/log-train")
 
-    if args.tensorboard and rank == 0:
-        tb_writer = SummaryWriter(log_dir=f"{params.exp_dir}/tensorboard")
-    else:
-        tb_writer = None
-
-    if torch.cuda.is_available():
-        params.device = torch.device("cuda", rank)
-    else:
-        params.device = torch.device("cpu")
-    logging.info(f"Device: {params.device}")
-
-    if params.tokenizer == "emilia":
-        tokenizer = EmiliaTokenizer(token_file=params.token_file)
-    elif params.tokenizer == "libritts":
-        tokenizer = LibriTTSTokenizer(token_file=params.token_file)
-    elif params.tokenizer == "espeak":
-        tokenizer = EspeakTokenizer(token_file=params.token_file, lang=params.lang)
-    else:
-        assert params.tokenizer == "simple"
-        tokenizer = SimpleTokenizer(token_file=params.token_file)
-
-    tokenizer_config = {"vocab_size": tokenizer.vocab_size, "pad_id": tokenizer.pad_id}
-    params.update(tokenizer_config)
-
-    logging.info(params)
-
-    logging.info("About to create model")
-
-    model = ZipVoice(
-        **model_config["model"],
-        **tokenizer_config,
-    )
-
-    if params.checkpoint is not None:
-        logging.info(f"Loading pre-trained model from {params.checkpoint}")
-        _ = load_checkpoint(filename=params.checkpoint, model=model, strict=True)
-    num_param = sum([p.numel() for p in model.parameters()])
-    logging.info(f"Number of parameters : {num_param}")
-
-    model_avg: Optional[nn.Module] = None
     if rank == 0:
-        # model_avg is only used with rank 0
-        model_avg = copy.deepcopy(model).to(torch.float64)
+        logging.info("Params: ")
+        logging.info(params)
 
-    assert params.start_epoch > 0, params.start_epoch
-    if params.start_epoch > 1:
-        checkpoints = resume_checkpoint(params=params, model=model, model_avg=model_avg)
-
-    model = model.to(params.device)
-    if world_size > 1:
-        logging.info("Using DDP")
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-
-    optimizer = ScaledAdam(
-        get_parameter_groups_with_lrs(
-            model,
-            lr=params.base_lr,
-            include_names=True,
-        ),
-        lr=params.base_lr,  # should have no effect
-        clipping_scale=2.0,
-    )
-
-    assert params.lr_hours >= 0
-
-    if params.finetune:
-        scheduler = FixedLRScheduler(optimizer)
-    elif params.lr_hours > 0:
-        scheduler = Eden(optimizer, params.lr_batches, params.lr_hours)
-    else:
-        scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
-
-    scaler = create_grad_scaler(enabled=params.use_fp16)
-
-    if params.start_epoch > 1 and checkpoints is not None:
-        # load state_dict for optimizers
-        if "optimizer" in checkpoints:
-            logging.info("Loading optimizer state dict")
-            optimizer.load_state_dict(checkpoints["optimizer"])
-
-        # load state_dict for schedulers
-        if "scheduler" in checkpoints:
-            logging.info("Loading scheduler state dict")
-            scheduler.load_state_dict(checkpoints["scheduler"])
-
-        if "grad_scaler" in checkpoints:
-            logging.info("Loading grad scaler state dict")
-            scaler.load_state_dict(checkpoints["grad_scaler"])
-
-    if params.print_diagnostics:
-        opts = diagnostics.TensorDiagnosticOptions(
-            512
-        )  # allow 4 megabytes per sub-module
-        diagnostic = diagnostics.attach_diagnostics(model, opts)
-
-    if params.inf_check:
-        register_inf_check_hooks(model)
-
-    def remove_short_and_long_utt(c: Cut, min_len: float, max_len: float):
-        if c.duration < min_len or c.duration > max_len:
-            return False
-        return True
-
-    _remove_short_and_long_utt = partial(
-        remove_short_and_long_utt, min_len=params.min_len, max_len=params.max_len
-    )
-
-    datamodule = TtsDataModule(args)
-    if params.dataset == "emilia":
-        train_cuts = CutSet.mux(
-            datamodule.train_emilia_EN_cuts(),
-            datamodule.train_emilia_ZH_cuts(),
-            weights=[46000, 49000],
-        )
-        train_cuts = train_cuts.filter(_remove_short_and_long_utt)
-        dev_cuts = CutSet.mux(
-            datamodule.dev_emilia_EN_cuts(),
-            datamodule.dev_emilia_ZH_cuts(),
-            weights=[0.5, 0.5],
-        )
-    elif params.dataset == "libritts":
-        train_cuts = datamodule.train_libritts_cuts()
-        train_cuts = train_cuts.filter(_remove_short_and_long_utt)
-        dev_cuts = datamodule.dev_libritts_cuts()
-    elif params.dataset == "aishell3":
-        train_cuts = datamodule.train_cuts_aishell3()
-        train_cuts = train_cuts.filter(_remove_short_and_long_utt)
-        dev_cuts = datamodule.dev_cuts_aishell3()
-        dev_cuts = dev_cuts.filter(_remove_short_and_long_utt)
-    else:
-        assert params.dataset == "custom"
-        train_cuts = datamodule.train_custom_cuts(params.train_manifest)
-        train_cuts = train_cuts.filter(_remove_short_and_long_utt)
-        dev_cuts = datamodule.dev_custom_cuts(params.dev_manifest)
-        # To avoid OOM issues due to too long dev cuts
-        dev_cuts = dev_cuts.filter(_remove_short_and_long_utt)
-
-    if params.tokenizer in ["emilia", "espeak", "dialog"]:
-        if not hasattr(train_cuts[0].supervisions[0], "tokens") or not hasattr(
-            dev_cuts[0].supervisions[0], "tokens"
-        ):
-            logging.warning(
-                f"Using {params.tokenizer} tokenizer but tokens are not prepared,"
-                f"will tokenize on-the-fly, which can slow down training significantly."
-            )
-    _tokenize_text = partial(tokenize_text, tokenizer=tokenizer)
-    # train_cuts = train_cuts.map(_tokenize_text)
-    # dev_cuts = dev_cuts.map(_tokenize_text)
-
-    train_dl = datamodule.train_dataloaders(train_cuts)
-
-    valid_dl = datamodule.dev_dataloaders(dev_cuts)
-
-    if params.scan_oom:
-        scan_pessimistic_batches_for_oom(
-            model=model,
-            train_dl=train_dl,
-            optimizer=optimizer,
-            params=params,
-            tokenizer=tokenizer,
-        )
-
-    logging.info("Training started")
-
-    for epoch in range(params.start_epoch, params.num_epochs + 1):
-        logging.info(f"Start epoch {epoch}")
-
-        if params.lr_hours == 0:
-            scheduler.step_epoch(epoch - 1)
-        fix_random_seed(params.seed + epoch - 1)
-        train_dl.sampler.set_epoch(epoch - 1)
-
-        params.cur_epoch = epoch
-
-        if tb_writer is not None:
-            tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
-
-        train_one_epoch(
-            params=params,
-            model=model,
-            model_avg=model_avg,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            train_dl=train_dl,
-            valid_dl=valid_dl,
-            scaler=scaler,
-            tb_writer=tb_writer,
-            world_size=world_size,
-            rank=rank,
-            tokenizer=tokenizer,
-        )
-
-        if params.num_iters > 0 and params.batch_idx_train > params.num_iters:
-            break
-
-        if params.print_diagnostics:
-            diagnostic.print_diagnostics()
-            break
-
-        filename = params.exp_dir / f"epoch-{params.cur_epoch}.pt"
-        save_checkpoint(
-            filename=filename,
-            params=params,
-            model=model,
-            model_avg=model_avg,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            sampler=train_dl.sampler,
-            scaler=scaler,
-            rank=rank,
-        )
-
-        if rank == 0:
-            if params.best_train_epoch == params.cur_epoch:
-                best_train_filename = params.exp_dir / "best-train-loss.pt"
-                copyfile(src=filename, dst=best_train_filename)
-
-            if params.best_valid_epoch == params.cur_epoch:
-                best_valid_filename = params.exp_dir / "best-valid-loss.pt"
-                copyfile(src=filename, dst=best_valid_filename)
-
-    logging.info("Done!")
+    train(params, rank, world_size)
 
     if world_size > 1:
         torch.distributed.barrier()
@@ -1128,7 +630,6 @@ def run(rank, world_size, args):
 
 def main():
     parser = get_parser()
-    TtsDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
 

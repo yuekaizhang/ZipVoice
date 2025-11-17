@@ -11,8 +11,10 @@ set -e
 set -u
 set -o pipefail
 
-stage=1
-stop_stage=6
+export HF_HOME="./hf_cache"
+
+stage=$1
+stop_stage=$2
 
 # Number of jobs for data preparation
 nj=20
@@ -52,10 +54,10 @@ download_dir=download/
 #     to part of the wav. The start_time and end_time specify the start and end
 #     times of the text within the wav, which should be in seconds.
 # > Note: {uniq_id} must be unique for each line.
-for subset in train dev;do
-      file_path=data/raw/custom_${subset}.tsv
-      [ -f "$file_path" ] || { echo "Error: expect $file_path !" >&2; exit 1; }
-done
+# for subset in train dev;do
+#       file_path=data/raw/custom_${subset}.tsv
+#       [ -f "$file_path" ] || { echo "Error: expect $file_path !" >&2; exit 1; }
+# done
 
 ### Prepare the training data (1 - 4)
 
@@ -177,7 +179,7 @@ if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
 
       [ -z "$max_len" ] && { echo "Error: max_len is not set!" >&2; exit 1; }
 
-      python3 -m zipvoice.bin.train_zipvoice \
+      python3 -m zipvoice.bin.train_zipvoice_grpo \
             --world-size 4 \
             --use-fp16 1 \
             --finetune 1 \
@@ -191,9 +193,15 @@ if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
             --tokenizer ${tokenizer} \
             --lang ${lang} \
             --token-file ${download_dir}/zipvoice/tokens.txt \
-            --dataset custom \
-            --train-manifest data/fbank/custom-finetune_cuts_train.jsonl.gz \
-            --dev-manifest data/fbank/custom-finetune_cuts_dev.jsonl.gz \
-            --exp-dir exp/zipvoice_finetune
+            --dataset aishell3 \
+            --exp-dir exp/zipvoice_finetune \
+            --on-the-fly-feats True
 
+fi
+
+if [ ${stage} -le 9 ] && [ ${stop_stage} -ge 9 ]; then
+      echo "Stage 9: install k2"
+      pip install k2==1.24.4.dev20250208+cuda12.1.torch2.5.1 -f https://k2-fsa.github.io/k2/cuda.html
+      # https://github.com/k2-fsa/k2/blob/master/k2/python/k2/__init__.py#L13 delete the cuda version check
+      RUN sed -i '/if (/,/^    )/d' /usr/local/lib/python3.12/dist-packages/k2/__init__.py
 fi

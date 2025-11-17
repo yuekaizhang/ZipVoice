@@ -459,7 +459,7 @@ class ZipVoice(nn.Module):
             device=text_condition.device,
         )
         if enable_sde:
-            x1, log_prob, prev_sample_mean, std_dev_t = self.solver.sample(
+            x1, log_probs, latents, timesteps, prev_sample_means, std_dev_ts = self.solver.sample(
                 x=x0,
                 text_condition=text_condition,
                 speech_condition=speech_condition,
@@ -497,8 +497,7 @@ class ZipVoice(nn.Module):
                 i, : prompt_features_lens[i]
             ]
         if enable_sde:
-            # TODO: support mask here
-            return x1_wo_prompt, x1_wo_prompt_lens, x1_prompt, prompt_features_lens, log_prob, prev_sample_mean, std_dev_t
+            return x1_wo_prompt, x1_wo_prompt_lens, x1_prompt, prompt_features_lens, log_probs, latents, timesteps
         else:
             return x1_wo_prompt, x1_wo_prompt_lens, x1_prompt, prompt_features_lens
 

@@ -338,6 +338,11 @@ class EulerSolver:
             device=device,
         )
 
+        log_probs = []
+        latents = [x]
+        prev_sample_means = []
+        std_dev_ts = []
+
         for step in range(num_step):
             v = self.model(
                 t=timesteps[step],
@@ -349,7 +354,6 @@ class EulerSolver:
                 **kwargs
             )
             if enable_sde:
-                print(f"noise_level: {sde_noise_level}")
                 x, log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
                     v,
                     timesteps[step + 1],
@@ -357,11 +361,15 @@ class EulerSolver:
                     x,
                     noise_level=sde_noise_level,
                 )
+                latents.append(x)
+                log_probs.append(log_prob)
+                prev_sample_means.append(prev_sample_mean)
+                std_dev_ts.append(std_dev_t)
             else:
                 x = x + v * (timesteps[step + 1] - timesteps[step])
-
+            
         if enable_sde:
-            return x, log_prob, prev_sample_mean, std_dev_t
+            return x, log_probs, latents, timesteps, prev_sample_means, std_dev_ts
         else:
             return x
 

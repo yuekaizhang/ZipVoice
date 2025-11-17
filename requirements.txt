@@ -19,3 +19,6 @@ jieba
 piper_phonemize
 pypinyin
 setuptools<81
+
+# 
+datasets==3.1.0

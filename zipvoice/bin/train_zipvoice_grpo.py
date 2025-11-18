@@ -78,6 +78,7 @@ from zipvoice.utils.common import (
     str2bool,
     torch_autocast,
 )
+from egs.zipvoice_rl.reward_client import asr_reward_computation
 
 tqdm = partial(tqdm, dynamic_ncols=True)
 
@@ -104,6 +105,7 @@ class DistributedKRepeatSampler(Sampler):
             g.manual_seed(self.seed + self.epoch)
 
             indices = torch.randperm(len(self.dataset), generator=g)[: self.m].tolist()
+            print(f"2333: indices: {indices}")
 
             repeated_indices = [idx for idx in indices for _ in range(self.k)]
 
@@ -152,9 +154,10 @@ class SpeechPromptDataset(Dataset):
     def __len__(self):
         return len(self.target_texts)
 
-    def _get_random_prompt(self):
-        random_idx = random.randint(0, len(self.prompt_dataset) - 1)
-        sample = self.prompt_dataset[random_idx]
+    def _get_prompt(self, idx: int):
+        prompt_idx = idx % len(self.prompt_dataset)
+        # print(f"2333: {prompt_idx}, {idx}")
+        sample = self.prompt_dataset[prompt_idx]
 
         prompt_text = sample["text"].replace(" ", "")
 
@@ -167,7 +170,7 @@ class SpeechPromptDataset(Dataset):
 
     def __getitem__(self, idx):
         target_text = self.target_texts[idx]
-        prompt_text, prompt_wav, prompt_sampling_rate = self._get_random_prompt()
+        prompt_text, prompt_wav, prompt_sampling_rate = self._get_prompt(idx)
 
         item = {
             "id": f"item_{idx}",
@@ -306,8 +309,8 @@ def get_parser():
     parser.add_argument("--guidance-scale", type=float, default=3.0)
     parser.add_argument("--train-batch-size", type=int, default=4)
     parser.add_argument("--num-audio-per-prompt", type=int, default=4)
-    parser.add_argument("--num-batches-per-epoch", type=int, default=8)
-    parser.add_argument("--noise-level", type=float, default=0.2)
+    parser.add_argument("--num-batches-per-epoch", type=int, default=2)
+    parser.add_argument("--noise-level", type=float, default=0.8)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--adam-beta1", type=float, default=0.9)
     parser.add_argument("--adam-beta2", type=float, default=0.999)
@@ -356,7 +359,7 @@ def train(params: AttributeDict, rank: int, world_size: int):
     """The main training loop."""
     device = torch.device("cuda", rank)
     fix_random_seed(params.seed)
-    torch.autograd.set_detect_anomaly(True)
+    # torch.autograd.set_detect_anomaly(True)
 
     # Setup logging
     if rank == 0:
@@ -400,18 +403,18 @@ def train(params: AttributeDict, rank: int, world_size: int):
     train_dataloader = DataLoader(
         train_dataset,
         batch_sampler=train_sampler,
-        num_workers=1,
+        num_workers=0,
         collate_fn=SpeechPromptDataset.collate_fn,
     )
 
     scaler = create_grad_scaler(enabled=params.use_fp16)
 
     # Placeholder reward function
-    def placeholder_reward_fn(wavs, texts, metadata):
-        rewards = {"placeholder_reward": [random.random() for _ in wavs]}
-        return rewards, {}
+    # def placeholder_reward_fn(wavs, texts, metadata):
+    #     rewards = {"placeholder_reward": [random.random() for _ in wavs]}
+    #     return rewards, {}
 
-    reward_fn = placeholder_reward_fn
+    reward_fn = asr_reward_computation
 
     executor = futures.ThreadPoolExecutor(max_workers=2)
     autocast = partial(torch_autocast, dtype=torch.float16, enabled=params.use_fp16)
@@ -437,13 +440,17 @@ def train(params: AttributeDict, rank: int, world_size: int):
             disable=rank != 0,
             position=0,
         ):
+            # print(f"2333: {i}")
+            train_sampler.set_epoch(epoch*params.num_batches_per_epoch + i)
             ids, prompt_wavs_list, prompt_texts_list, target_texts_list = next(
                 train_iter
             )
+
+            # print(f"2333: {ids}")
             prompts = [
                 p + " " + t for p, t in zip(prompt_texts_list, target_texts_list)
             ]
-
+            # breakpoint()
             with torch.no_grad():
                 with autocast():
                     audios, latents, log_probs, timesteps = pipeline(
@@ -466,6 +473,7 @@ def train(params: AttributeDict, rank: int, world_size: int):
                 prompt_wav=prompt_wavs_list,
                 text=target_texts_list,
             )
+            # breakpoint()
             unwrapped_model = model.module if isinstance(model, DDP) else model
             text_condition, padding_mask = (
                 unwrapped_model.forward_text_inference_ratio_duration(
@@ -475,61 +483,53 @@ def train(params: AttributeDict, rank: int, world_size: int):
                     speed=1.0,
                 )
             )
-
+            # breakpoint()
             num_frames = text_condition.shape[1]
             prompt_features = prepared_inputs["prompt_features"]
             speech_condition = torch.nn.functional.pad(
                 prompt_features, (0, 0, 0, num_frames - prompt_features.size(1))
             )
 
-            rewards_future = executor.submit(reward_fn, audios, target_texts_list, {})
+            rewards_future = executor.submit(reward_fn, audios, target_texts_list)
 
             samples.append(
                 {
-                    "prompts": prompts,
-                    "latents": latents[:, :-1],
-                    "next_latents": latents[:, 1:],
-                    "log_probs": log_probs,
-                    "timesteps": timesteps,
-                    "text_condition": text_condition,
-                    "speech_condition": speech_condition,
-                    "padding_mask": padding_mask,
+                    "prompts": prompts, # list[str]
+                    "latents": latents[:, :-1], # torch.Tensor(batch_size, num_timesteps, num_frames, feat_dim)
+                    "next_latents": latents[:, 1:], # torch.Tensor(batch_size, num_timesteps, num_frames, feat_dim)
+                    "log_probs": log_probs, # torch.Tensor(batch_size, num_timesteps - 1)
+                    "timesteps": timesteps, # torch.Tensor(batch_size, num_timesteps)
+                    "text_condition": text_condition.detach(),
+                    "speech_condition": speech_condition.detach(),
+                    "padding_mask": padding_mask.detach(),
                     "rewards": rewards_future,
                 }
             )
+            # breakpoint()
+        # breakpoint()
 
         for sample in tqdm(samples, desc="Waiting for rewards", disable=rank != 0):
             rewards, _ = sample["rewards"].result()
+            # dict[str, list[float]] -> dict[str, torch.Tensor]
             sample["rewards"] = {
                 k: torch.as_tensor(v, device=device).float()
                 for k, v in rewards.items()
             }
+            # breakpoint()
+        # breakpoint()
 
         # Advantage calculation
         all_prompts = [p for s in samples for p in s["prompts"]]
         all_rewards = torch.cat(
-            [s["rewards"]["placeholder_reward"] for s in samples], dim=0
+            [s["rewards"]["asr_reward"] for s in samples], dim=0
         )
 
         if world_size > 1:
-            # Gather rewards
-            local_size = torch.tensor([all_rewards.size(0)], device=device)
-            all_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
-            torch.distributed.all_gather(all_sizes, local_size)
-            max_size = max(s.item() for s in all_sizes)
-
-            padded_rewards = torch.zeros(max_size, device=device)
-            padded_rewards[: all_rewards.size(0)] = all_rewards
-
-            all_rewards_padded = [
-                torch.zeros_like(padded_rewards) for _ in range(world_size)
-            ]
-            torch.distributed.all_gather(all_rewards_padded, padded_rewards)
-
-            gathered_rewards = []
-            for i in range(world_size):
-                gathered_rewards.append(all_rewards_padded[i][: all_sizes[i].item()])
-            gathered_rewards_tensor = torch.cat(gathered_rewards)
+            # Gather rewards from all GPUs.
+            # `all_gather_object` is used here for simplicity as the rewards tensor is small.
+            gathered_rewards_list = [None] * world_size
+            torch.distributed.all_gather_object(gathered_rewards_list, all_rewards)
+            gathered_rewards_tensor = torch.cat([t.cpu() for t in gathered_rewards_list], dim=0)
 
             # Gather prompts
             gathered_prompts_list = [None] * world_size
@@ -545,6 +545,7 @@ def train(params: AttributeDict, rank: int, world_size: int):
             advantages = stat_tracker.update(
                 gathered_prompts, gathered_rewards_tensor.cpu().numpy()
             )
+            # breakpoint()
             stat_tracker.clear()
         else:
             mean = gathered_rewards_tensor.mean()
@@ -556,11 +557,11 @@ def train(params: AttributeDict, rank: int, world_size: int):
 
         # Distribute advantages
         local_advantages = advantages.chunk(world_size)[rank]
-
+        # breakpoint()
         # Add advantages to samples
         current_pos = 0
         for s in samples:
-            batch_size = s["latents"].shape[0]
+            batch_size = s["latents"].shape[0] # [4, 16, 894, 100]
             s["advantages"] = (
                 local_advantages[current_pos : current_pos + batch_size]
                 .unsqueeze(1)
@@ -586,7 +587,8 @@ def train(params: AttributeDict, rank: int, world_size: int):
                 disable=rank != 0,
                 total=len(samples)
             ):
-                loss_per_batch = 0
+                timestep_losses = []
+                num_train_timesteps = 2
                 for j in range(num_train_timesteps):
                     with autocast():
                         unwrapped_model = model.module if isinstance(model, DDP) else model
@@ -608,14 +610,15 @@ def train(params: AttributeDict, rank: int, world_size: int):
                             1.0 + params.clip_range,
                         )
                         loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-                        
-                        # Accumulate loss over timesteps
-                        loss_per_batch = loss_per_batch + loss / num_train_timesteps
+                        timestep_losses.append(loss)
 
-                # Accumulate loss for gradient accumulation
-                loss_to_backward = loss_per_batch / params.gradient_accumulation_steps
-                scaler.scale(loss_to_backward).backward()
+                # Sum the losses from all timesteps and average
+                total_loss = sum(timestep_losses) / num_train_timesteps
                 
+                # Accumulate loss for gradient accumulation
+                loss_to_backward = total_loss / params.gradient_accumulation_steps
+                scaler.scale(loss_to_backward).backward()
+
                 if (i + 1) % params.gradient_accumulation_steps == 0 or (i + 1) == len(samples):
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
@@ -652,7 +655,6 @@ def train(params: AttributeDict, rank: int, world_size: int):
                 out_dir=params.exp_dir,
                 topk=params.num_checkpoint_limit,
                 rank=rank,
-                prefix="epoch-"
             )
 
 

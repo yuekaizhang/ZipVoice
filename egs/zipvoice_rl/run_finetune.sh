@@ -180,7 +180,7 @@ if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
       # [ -z "$max_len" ] && { echo "Error: max_len is not set!" >&2; exit 1; }
 
       python3 -m zipvoice.bin.train_zipvoice_grpo \
-      --world-size 2 \
+      --world-size 1 \
       --use-fp16 1 \
       --exp-dir exp/zipvoice_grpo \
       --pretrained-model zipvoice_distill \
@@ -194,3 +194,16 @@ if [ ${stage} -le 9 ] && [ ${stop_stage} -ge 9 ]; then
       # https://github.com/k2-fsa/k2/blob/master/k2/python/k2/__init__.py#L13 delete the cuda version check
       RUN sed -i '/if (/,/^    )/d' /usr/local/lib/python3.12/dist-packages/k2/__init__.py
 fi
+
+
+n_gpus=1
+if [ $stage -le 10 ] && [ $stop_stage -ge 10 ]; then
+  echo "stage 10: start token2wav asr server for reward function"
+
+#   git clone https://github.com/yuekaizhang/PytritonSenseVoice.git /workspace/PytritonSenseVoice
+#   cd /workspace/PytritonSenseVoice
+#   pip install -e .
+  # pip install jiwer WeTextProcessing
+  CUDA_VISIBLE_DEVICES=0 python3 reward_server.py --number-of-devices $n_gpus
+
+fi 

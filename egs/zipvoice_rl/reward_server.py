@@ -124,7 +124,7 @@ def main():
     parser.add_argument(
         "--max-batch-size",
         type=int,
-        default=4,
+        default=64,
         help="Batch size of request.",
         required=False,
     )

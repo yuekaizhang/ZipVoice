@@ -181,6 +181,14 @@ if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
 
       python3 -m zipvoice.bin.train_zipvoice_grpo \
       --world-size 1 \
+      --num-steps 4 \
+      --train-batch-size 64 \
+      --num-audio-per-prompt 8 \
+      --num-batches-per-epoch 2 \
+      --noise-level 0.8 \
+      --global-std 1 \
+      --learning-rate 1e-5 \
+      --save-freq 100 \
       --use-fp16 1 \
       --exp-dir exp/zipvoice_grpo \
       --pretrained-model zipvoice_distill \
@@ -207,3 +215,23 @@ if [ $stage -le 10 ] && [ $stop_stage -ge 10 ]; then
   CUDA_VISIBLE_DEVICES=0 python3 reward_server.py --number-of-devices $n_gpus
 
 fi 
+
+if [ $stage -le 11 ] && [ $stop_stage -ge 11 ]; then
+  echo "stage 11: Test the model"
+  datasets=(wenetspeech4tts zero_shot_zh test_zh)
+  datasets=(zero_shot_zh)
+  # datasets=(wenetspeech4tts)
+  for dataset in ${datasets[@]}; do
+  output_dir=./outputs_sensevoice_zipvoice_grpo_${dataset}
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+
+  python3 test_pipeline.py \
+    --world-size 8 \
+    --results-dir $output_dir \
+    --batch-size 32 \
+    --noise-level 0.0 \
+    --huggingface-dataset-split ${dataset}
+
+  # bash scripts/compute_wer.sh $output_dir ${dataset}
+  done
+fi

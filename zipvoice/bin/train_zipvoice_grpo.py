@@ -31,17 +31,14 @@ python3 -m zipvoice.bin.train_zipvoice_grpo \
 """
 
 import argparse
-import copy
 import json
 import logging
 import os
 import random
-import time
 from concurrent import futures
 from functools import partial
 from pathlib import Path
-from shutil import copyfile
-from typing import List, Optional, Tuple, Union
+from typing import List
 
 import torch
 import torch.multiprocessing as mp
@@ -52,27 +49,20 @@ from datasets import load_dataset
 from lhotse.utils import fix_random_seed
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim import Optimizer
 from torch.utils.data import DataLoader, Dataset, Sampler
-from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 from zipvoice.rl.stat_tracking import PerPromptStatTracker
 from zipvoice.rl.pipeline_zipvoice import ZipVoicePipeline
 from zipvoice.models.modules.solver import sde_step_with_logprob
 from zipvoice.utils.checkpoint import (
-    load_checkpoint,
     remove_checkpoints,
-    resume_checkpoint,
     save_checkpoint,
-    save_checkpoint_with_global_batch_idx,
 )
 from zipvoice.utils.common import (
     AttributeDict,
-    GradScaler,
     cleanup_dist,
     create_grad_scaler,
-    get_env_info,
     setup_dist,
     setup_logger,
     str2bool,
@@ -105,7 +95,6 @@ class DistributedKRepeatSampler(Sampler):
             g.manual_seed(self.seed + self.epoch)
 
             indices = torch.randperm(len(self.dataset), generator=g)[: self.m].tolist()
-            print(f"2333: indices: {indices}")
 
             repeated_indices = [idx for idx in indices for _ in range(self.k)]
 
@@ -130,7 +119,6 @@ class SpeechPromptDataset(Dataset):
     def __init__(
         self,
         target_text_path,
-        split="train",
         prompt_dataset_name="yuekai/aishell",
         prompt_dataset_split="test",
     ):
@@ -156,7 +144,6 @@ class SpeechPromptDataset(Dataset):
 
     def _get_prompt(self, idx: int):
         prompt_idx = idx % len(self.prompt_dataset)
-        # print(f"2333: {prompt_idx}, {idx}")
         sample = self.prompt_dataset[prompt_idx]
 
         prompt_text = sample["text"].replace(" ", "")
@@ -214,8 +201,6 @@ def compute_log_prob(model, pipeline, sample, j, params):
     step_index = (timesteps[0] == timesteps[:, j][0]).nonzero().item()
 
     current_t = timesteps[0, step_index]
-    # print(f"current_t: {current_t}, current_t.shape: {current_t.shape}")
-    # breakpoint()
     next_t = timesteps[0, step_index + 1]
 
     # Predict the velocity
@@ -269,20 +254,6 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--tensorboard",
-        type=str2bool,
-        default=True,
-        help="Should various information be logged in tensorboard.",
-    )
-
-    parser.add_argument(
-        "--start-epoch",
-        type=int,
-        default=1,
-        help="""Resume training from this epoch.""",
-    )
-
-    parser.add_argument(
         "--exp-dir",
         type=str,
         default="exp/zipvoice_grpo",
@@ -297,12 +268,8 @@ def get_parser():
     )
     # New arguments from train_tts.py config
     parser.add_argument("--run-name", type=str, default="tts_rl_8gpu")
-    parser.add_argument("--logdir", type=str, default="logs")
-    parser.add_argument("--save-freq", type=int, default=20)
+    parser.add_argument("--save-freq", type=int, default=100)
     parser.add_argument("--num-checkpoint-limit", type=int, default=5)
-    parser.add_argument(
-        "--mixed-precision", type=str, default="fp16", choices=["fp16", "bf16", "no"]
-    )
     parser.add_argument("--dataset-path", type=str, default="aishell-3-cosy.jsonl")
     parser.add_argument("--pretrained-model", type=str, default="zipvoice_distill")
     parser.add_argument("--num-steps", type=int, default=16)
@@ -359,7 +326,6 @@ def train(params: AttributeDict, rank: int, world_size: int):
     """The main training loop."""
     device = torch.device("cuda", rank)
     fix_random_seed(params.seed)
-    # torch.autograd.set_detect_anomaly(True)
 
     # Setup logging
     if rank == 0:
@@ -409,11 +375,6 @@ def train(params: AttributeDict, rank: int, world_size: int):
 
     scaler = create_grad_scaler(enabled=params.use_fp16)
 
-    # Placeholder reward function
-    # def placeholder_reward_fn(wavs, texts, metadata):
-    #     rewards = {"placeholder_reward": [random.random() for _ in wavs]}
-    #     return rewards, {}
-
     reward_fn = asr_reward_computation
 
     executor = futures.ThreadPoolExecutor(max_workers=2)
@@ -440,17 +401,14 @@ def train(params: AttributeDict, rank: int, world_size: int):
             disable=rank != 0,
             position=0,
         ):
-            # print(f"2333: {i}")
             train_sampler.set_epoch(epoch*params.num_batches_per_epoch + i)
             ids, prompt_wavs_list, prompt_texts_list, target_texts_list = next(
                 train_iter
             )
 
-            # print(f"2333: {ids}")
             prompts = [
                 p + " " + t for p, t in zip(prompt_texts_list, target_texts_list)
             ]
-            # breakpoint()
             with torch.no_grad():
                 with autocast():
                     audios, latents, log_probs, timesteps = pipeline(
@@ -473,7 +431,6 @@ def train(params: AttributeDict, rank: int, world_size: int):
                 prompt_wav=prompt_wavs_list,
                 text=target_texts_list,
             )
-            # breakpoint()
             unwrapped_model = model.module if isinstance(model, DDP) else model
             text_condition, padding_mask = (
                 unwrapped_model.forward_text_inference_ratio_duration(
@@ -483,7 +440,6 @@ def train(params: AttributeDict, rank: int, world_size: int):
                     speed=1.0,
                 )
             )
-            # breakpoint()
             num_frames = text_condition.shape[1]
             prompt_features = prepared_inputs["prompt_features"]
             speech_condition = torch.nn.functional.pad(
@@ -505,8 +461,6 @@ def train(params: AttributeDict, rank: int, world_size: int):
                     "rewards": rewards_future,
                 }
             )
-            # breakpoint()
-        # breakpoint()
 
         for sample in tqdm(samples, desc="Waiting for rewards", disable=rank != 0):
             rewards, _ = sample["rewards"].result()
@@ -515,8 +469,6 @@ def train(params: AttributeDict, rank: int, world_size: int):
                 k: torch.as_tensor(v, device=device).float()
                 for k, v in rewards.items()
             }
-            # breakpoint()
-        # breakpoint()
 
         # Advantage calculation
         all_prompts = [p for s in samples for p in s["prompts"]]
@@ -545,7 +497,6 @@ def train(params: AttributeDict, rank: int, world_size: int):
             advantages = stat_tracker.update(
                 gathered_prompts, gathered_rewards_tensor.cpu().numpy()
             )
-            # breakpoint()
             stat_tracker.clear()
         else:
             mean = gathered_rewards_tensor.mean()
@@ -557,7 +508,6 @@ def train(params: AttributeDict, rank: int, world_size: int):
 
         # Distribute advantages
         local_advantages = advantages.chunk(world_size)[rank]
-        # breakpoint()
         # Add advantages to samples
         current_pos = 0
         for s in samples:
@@ -588,7 +538,6 @@ def train(params: AttributeDict, rank: int, world_size: int):
                 total=len(samples)
             ):
                 timestep_losses = []
-                num_train_timesteps = 2
                 for j in range(num_train_timesteps):
                     with autocast():
                         unwrapped_model = model.module if isinstance(model, DDP) else model

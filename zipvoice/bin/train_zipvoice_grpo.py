@@ -69,6 +69,13 @@ from zipvoice.utils.common import (
     torch_autocast,
 )
 from egs.zipvoice_rl.reward_client import asr_reward_computation
+import numpy as np
+import torch.distributed as dist
+from egs.zipvoice_rl.scripts.offline_decode_files import (
+    store_transcripts,
+    write_error_stats,
+    normalize_text_alimeeting,
+)
 
 tqdm = partial(tqdm, dynamic_ncols=True)
 
@@ -319,7 +326,214 @@ def get_parser():
         help="""Only keep this number of checkpoints on disk.""",
     )
 
+    # Evaluation arguments
+    parser.add_argument(
+        "--eval-freq", type=int, default=100, help="Evaluate every N steps."
+    )
+    parser.add_argument(
+        "--huggingface-dataset-split",
+        type=str,
+        default="zero_shot_zh",
+        help="Split of evaluation dataset to use.",
+    )
+    parser.add_argument(
+        "--eval-batch-size", type=int, default=4, help="Batch size for evaluation."
+    )
+
     return parser
+
+
+def eval_collate_fn(batch):
+    target_sampling_rate = 24000
+    ids, prompt_wavs_list, prompt_texts_list, target_texts_list = [], [], [], []
+
+    for item in batch:
+        prompt_wav = torch.from_numpy(item["prompt_audio"]["array"]).float()
+        prompt_sampling_rate = item["prompt_audio"]["sampling_rate"]
+
+        if prompt_sampling_rate != target_sampling_rate:
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=prompt_sampling_rate,
+                new_freq=target_sampling_rate,
+            )
+            prompt_wav = resampler(prompt_wav)
+
+        prompt_wavs_list.append(prompt_wav)
+        prompt_texts_list.append(item["prompt_text"])
+        target_texts_list.append(item["target_text"])
+        ids.append(item["id"])
+
+    return ids, prompt_wavs_list, prompt_texts_list, target_texts_list
+
+
+def evaluate(
+    params: AttributeDict,
+    rank: int,
+    world_size: int,
+    pipeline: ZipVoicePipeline,
+    epoch: int,
+    global_step: int,
+):
+    """Run evaluation and log metrics."""
+    if rank == 0:
+        logging.info(f"***** Running evaluation at step {global_step} *****")
+
+    device = torch.device("cuda", rank)
+
+    # Create results directory
+    eval_dir = Path(params.exp_dir) / f"eval_step_{global_step}"
+    if rank == 0:
+        os.makedirs(eval_dir, exist_ok=True)
+
+    # Dataset and Dataloader for evaluation
+    dataset_name = "yuekai/CV3-Eval" if 'zero' in params.huggingface_dataset_split else "yuekai/seed_tts_cosy2"
+    eval_dataset = load_dataset(
+        dataset_name,
+        split=params.huggingface_dataset_split,
+        trust_remote_code=True,
+    )
+    if world_size > 1:
+        eval_sampler = torch.utils.data.distributed.DistributedSampler(
+            eval_dataset, shuffle=False
+        )
+    else:
+        eval_sampler = None
+
+    eval_dataloader = DataLoader(
+        eval_dataset,
+        batch_size=params.eval_batch_size,
+        shuffle=False,
+        sampler=eval_sampler,
+        num_workers=0,
+        collate_fn=eval_collate_fn,
+    )
+
+    pipeline.model.eval()
+
+    # Store results for the current rank
+    ids_list, target_texts_list_rank, transcripts_list_rank, rewards_list_rank = (
+        [],
+        [],
+        [],
+        [],
+    )
+
+    autocast = partial(torch_autocast, dtype=torch.float16, enabled=params.use_fp16)
+
+    with torch.no_grad():
+        for batch in tqdm(
+            eval_dataloader,
+            desc=f"Evaluation at step {global_step}",
+            disable=rank != 0,
+        ):
+            ids, prompt_wavs_list, prompt_texts_list, target_texts_list = batch
+
+            with autocast():
+                output_wavs, _, _, _ = pipeline(
+                    prompt_text=prompt_texts_list,
+                    prompt_wav=prompt_wavs_list,
+                    text=target_texts_list,
+                    num_step=params.num_steps,
+                    guidance_scale=params.guidance_scale,
+                    enable_sde=True,
+                    sde_noise_level=0.0,
+                )
+
+            for i, wav in enumerate(output_wavs):
+                save_id = f"{ids[i]}"
+                save_path = f"{eval_dir}/{save_id}.wav"
+                torchaudio.save(save_path, wav.cpu(), sample_rate=pipeline.sampling_rate)
+
+            rewards, metadata = asr_reward_computation(output_wavs, target_texts_list)
+            transcripts = metadata.get("transcripts", [""] * len(output_wavs))
+
+            ids_list.extend(ids)
+            target_texts_list_rank.extend(target_texts_list)
+            transcripts_list_rank.extend(transcripts)
+            rewards_list_rank.extend(rewards["asr_reward"])
+
+    if world_size > 1:
+        dist.barrier()  # wait for all processes to finish inference
+
+        # gather all results
+        gathered_ids = [None] * world_size
+        dist.all_gather_object(gathered_ids, ids_list)
+
+        gathered_targets = [None] * world_size
+        dist.all_gather_object(gathered_targets, target_texts_list_rank)
+
+        gathered_transcripts = [None] * world_size
+        dist.all_gather_object(gathered_transcripts, transcripts_list_rank)
+
+        gathered_rewards = [None] * world_size
+        dist.all_gather_object(gathered_rewards, rewards_list_rank)
+
+        if rank == 0:
+            # Flatten lists
+            all_ids = [item for sublist in gathered_ids for item in sublist]
+            all_targets = [item for sublist in gathered_targets for item in sublist]
+            all_transcripts = [
+                item for sublist in gathered_transcripts for item in sublist
+            ]
+            all_rewards = [item for sublist in gathered_rewards for item in sublist]
+    else:
+        all_ids = ids_list
+        all_targets = target_texts_list_rank
+        all_transcripts = transcripts_list_rank
+        all_rewards = rewards_list_rank
+
+    if rank == 0:
+        # Calculate WER
+        final_results = []
+        for i in range(len(all_ids)):
+            normalized_target = normalize_text_alimeeting(all_targets[i])
+            final_results.append((all_ids[i], normalized_target, all_transcripts[i]))
+
+        store_transcripts(
+            filename=f"{eval_dir}/recogs-sensevoice.txt", texts=final_results
+        )
+        errs_file = f"{eval_dir}/errs-sensevoice.txt"
+        wer_line = ""
+        with open(errs_file, "w", encoding="utf-8") as f:
+            write_error_stats(f, "eval-set", final_results, enable_log=False)
+        with open(errs_file, "r") as f:
+            wer_line = f.readline().strip()
+            logging.info(wer_line)
+            logging.info(f.readline().strip())  # Detailed errors
+
+        wer = float(wer_line.split(" ")[2])
+
+        # Reward Statistics
+        rewards_arr = np.array(all_rewards)
+        mean_reward = np.mean(rewards_arr)
+        std_reward = np.std(rewards_arr)
+        variance_reward = np.var(rewards_arr)
+
+        stats_output = [
+            "--- Reward Statistics ---",
+            f"Mean reward: {mean_reward:.4f}",
+            f"Standard deviation of reward: {std_reward:.4f}",
+            f"Variance of reward: {variance_reward:.4f}",
+        ]
+
+        logging.info("\n".join(stats_output))
+
+        # Save to file
+        with open(f"{eval_dir}/rewards.txt", "w") as f:
+            f.write("\n".join(stats_output))
+
+        # Log to wandb
+        wandb.log(
+            {
+                "eval/wer": wer,
+                "eval/mean_reward": mean_reward,
+                "eval/variance_reward": variance_reward,
+            },
+            step=global_step,
+        )
+
+    if world_size > 1:
+        dist.barrier()
 
 
 def train(params: AttributeDict, rank: int, world_size: int):
@@ -385,8 +599,8 @@ def train(params: AttributeDict, rank: int, world_size: int):
     epoch = 0
     global_step = 0
     train_iter = iter(train_dataloader)
-    num_train_timesteps = params.num_steps
-
+    num_train_timesteps = params.num_steps - 1
+    num_train_timesteps = 1
     while True:
         #################### SAMPLING ####################
         if isinstance(model, DDP):
@@ -415,7 +629,7 @@ def train(params: AttributeDict, rank: int, world_size: int):
                         prompt_text=prompt_texts_list,
                         prompt_wav=prompt_wavs_list,
                         text=target_texts_list,
-                        num_step=num_train_timesteps,
+                        num_step=params.num_steps,
                         guidance_scale=params.guidance_scale,
                         enable_sde=True,
                         sde_noise_level=params.noise_level,
@@ -537,6 +751,13 @@ def train(params: AttributeDict, rank: int, world_size: int):
                 disable=rank != 0,
                 total=len(samples)
             ):
+                if global_step % params.eval_freq == 0:
+                    evaluate(params, rank, world_size, pipeline, epoch, global_step)
+                    # Restore model to training mode after evaluation
+                    if isinstance(model, DDP):
+                        model.module.train()
+                    else:
+                        model.train()
                 timestep_losses = []
                 for j in range(num_train_timesteps):
                     with autocast():

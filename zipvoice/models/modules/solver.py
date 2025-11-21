@@ -353,7 +353,8 @@ class EulerSolver:
                 guidance_scale=guidance_scale,
                 **kwargs
             )
-            if enable_sde:
+            # last step, use the original sample
+            if enable_sde and step == 0:
                 x, log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
                     v,
                     timesteps[step + 1],

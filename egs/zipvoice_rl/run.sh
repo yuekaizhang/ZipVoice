@@ -16,8 +16,6 @@ export HF_HOME="./hf_cache"
 stage=$1
 stop_stage=$2
 
-# Number of jobs for data preparation
-nj=20
 
 # Whether the language of training data is one of Chinese and English
 is_zh_en=1
@@ -58,52 +56,11 @@ download_dir=download/
 #       file_path=data/raw/custom_${subset}.tsv
 #       [ -f "$file_path" ] || { echo "Error: expect $file_path !" >&2; exit 1; }
 # done
-
-### Prepare the training data (1 - 4)
-
-if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
-      echo "Stage 1: Prepare manifests for custom dataset from tsv files"
-
-      for subset in train dev;do
-            python3 -m zipvoice.bin.prepare_dataset \
-                  --tsv-path data/raw/custom_${subset}.tsv \
-                  --prefix custom-finetune \
-                  --subset raw_${subset} \
-                  --num-jobs ${nj} \
-                  --output-dir data/manifests
-      done
-      # The output manifest files are "data/manifests/custom-finetune_cuts_raw_train.jsonl.gz".
-      # and "data/manifests/custom-finetune_cuts_raw_dev.jsonl.gz".
-fi
-
-
-if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
-      echo "Stage 2: Add tokens to manifests"
-      # For "emilia" and "espeak" tokenizers, it's better to prepare the tokens 
-      # before training. Otherwise, the on-the-fly tokenization can significantly
-      # slow down the training.
-      for subset in train dev;do
-            python3 -m zipvoice.bin.prepare_tokens \
-                  --input-file data/manifests/custom-finetune_cuts_raw_${subset}.jsonl.gz \
-                  --output-file data/manifests/custom-finetune_cuts_${subset}.jsonl.gz \
-                  --tokenizer ${tokenizer} \
-                  --lang ${lang}
-      done
-      # The output manifest files are "data/manifests/custom-finetune_cuts_train.jsonl.gz".
-      # and "data/manifests/custom-finetune_cuts_dev.jsonl.gz".
-fi
-
-if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
-      echo "Stage 3: Compute Fbank for custom dataset"
-      # You can skip this step and use `--on-the-fly-feats 1` in training stage
-      for subset in train dev; do
-            python3 -m zipvoice.bin.compute_fbank \
-                  --source-dir data/manifests \
-                  --dest-dir data/fbank \
-                  --dataset custom-finetune \
-                  --subset ${subset} \
-                  --num-jobs ${nj}
-      done
+if [ ${stage} -le 9 ] && [ ${stop_stage} -ge 9 ]; then
+      echo "Stage 9: install k2"
+      pip install k2==1.24.4.dev20250208+cuda12.1.torch2.5.1 -f https://k2-fsa.github.io/k2/cuda.html
+      # https://github.com/k2-fsa/k2/blob/master/k2/python/k2/__init__.py#L13 delete the cuda version check
+      RUN sed -i '/if (/,/^    )/d' /usr/local/lib/python3.12/dist-packages/k2/__init__.py
 fi
 
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
@@ -178,29 +135,26 @@ if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
       echo "Stage 8: RL Fine-tune the ZipVoice model using aishell 3 data"
 
       # [ -z "$max_len" ] && { echo "Error: max_len is not set!" >&2; exit 1; }
-
+      noise_level=0.8
+      num_steps=8
       python3 -m zipvoice.bin.train_zipvoice_grpo \
       --world-size 1 \
-      --num-steps 4 \
-      --train-batch-size 64 \
+      --num-steps ${num_steps} \
+      --train-batch-size 8 \
+      --eval-batch-size 32 \
       --num-audio-per-prompt 8 \
       --num-batches-per-epoch 2 \
-      --noise-level 0.8 \
+      --noise-level ${noise_level} \
       --global-std 1 \
       --learning-rate 1e-5 \
       --save-freq 100 \
+      --eval-freq 10 \
+      --huggingface-dataset-split wenetspeech4tts \
       --use-fp16 1 \
-      --exp-dir exp/zipvoice_grpo \
+      --exp-dir exp/zipvoice_grpo_${noise_level}_${num_steps}_only_first_step \
       --pretrained-model zipvoice_distill \
       --dataset-path aishell-3-cosy.jsonl
 
-fi
-
-if [ ${stage} -le 9 ] && [ ${stop_stage} -ge 9 ]; then
-      echo "Stage 9: install k2"
-      pip install k2==1.24.4.dev20250208+cuda12.1.torch2.5.1 -f https://k2-fsa.github.io/k2/cuda.html
-      # https://github.com/k2-fsa/k2/blob/master/k2/python/k2/__init__.py#L13 delete the cuda version check
-      RUN sed -i '/if (/,/^    )/d' /usr/local/lib/python3.12/dist-packages/k2/__init__.py
 fi
 
 
@@ -211,7 +165,7 @@ if [ $stage -le 10 ] && [ $stop_stage -ge 10 ]; then
 #   git clone https://github.com/yuekaizhang/PytritonSenseVoice.git /workspace/PytritonSenseVoice
 #   cd /workspace/PytritonSenseVoice
 #   pip install -e .
-  # pip install jiwer WeTextProcessing
+  # pip install jiwer WeTextProcessing wandb zhon
   CUDA_VISIBLE_DEVICES=0 python3 reward_server.py --number-of-devices $n_gpus
 
 fi 
@@ -220,18 +174,22 @@ if [ $stage -le 11 ] && [ $stop_stage -ge 11 ]; then
   echo "stage 11: Test the model"
   datasets=(wenetspeech4tts zero_shot_zh test_zh)
   datasets=(zero_shot_zh)
-  # datasets=(wenetspeech4tts)
+  datasets=(wenetspeech4tts)
   for dataset in ${datasets[@]}; do
-  output_dir=./outputs_sensevoice_zipvoice_grpo_${dataset}
-  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  noise_levels=(0.4 0.5 0.6 0.7)
+  num_steps=8
+  for noise_level in ${noise_levels[@]}; do
+  output_dir=results/only_first_step_${dataset}_${noise_level}_${num_steps}
   python3 test_pipeline.py \
-    --world-size 8 \
+    --world-size 1 \
+    --num-step ${num_steps} \
     --results-dir $output_dir \
     --batch-size 32 \
-    --noise-level 0.0 \
+    --noise-level ${noise_level} \
     --huggingface-dataset-split ${dataset}
-
+  done
   # bash scripts/compute_wer.sh $output_dir ${dataset}
   done
 fi

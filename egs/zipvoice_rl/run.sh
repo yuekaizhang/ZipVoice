@@ -137,6 +137,7 @@ if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
       # [ -z "$max_len" ] && { echo "Error: max_len is not set!" >&2; exit 1; }
       noise_level=0.8
       num_steps=8
+      exp_name=zipvoice_grpo_${noise_level}_${num_steps}_only_first_step
       python3 -m zipvoice.bin.train_zipvoice_grpo \
       --world-size 1 \
       --num-steps ${num_steps} \
@@ -151,22 +152,24 @@ if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
       --eval-freq 10 \
       --huggingface-dataset-split wenetspeech4tts \
       --use-fp16 1 \
-      --exp-dir exp/zipvoice_grpo_${noise_level}_${num_steps}_only_first_step \
+      --run-name ${exp_name} \
+      --exp-dir exp/${exp_name} \
       --pretrained-model zipvoice_distill \
       --dataset-path aishell-3-cosy.jsonl
 
 fi
 
 
-n_gpus=1
+
 if [ $stage -le 10 ] && [ $stop_stage -ge 10 ]; then
   echo "stage 10: start token2wav asr server for reward function"
 
 #   git clone https://github.com/yuekaizhang/PytritonSenseVoice.git /workspace/PytritonSenseVoice
 #   cd /workspace/PytritonSenseVoice
 #   pip install -e .
-  # pip install jiwer WeTextProcessing wandb zhon
-  CUDA_VISIBLE_DEVICES=0 python3 reward_server.py --number-of-devices $n_gpus
+  # pip install jiwer WeTextProcessing wandb zhon sherpa-onnx
+  n_gpus=8
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 reward_server.py --number-of-devices $n_gpus
 
 fi 
 
@@ -175,21 +178,29 @@ if [ $stage -le 11 ] && [ $stop_stage -ge 11 ]; then
   datasets=(wenetspeech4tts zero_shot_zh test_zh)
   datasets=(zero_shot_zh)
   datasets=(wenetspeech4tts)
+  # datasets=(test_zh)
   for dataset in ${datasets[@]}; do
 
-  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
   noise_levels=(0.4 0.5 0.6 0.7)
-  num_steps=8
+  noise_levels=(0.8)
+  guidance_scale=1.0
+  model_name=zipvoice
+  num_steps=16
+  rollout_n=8
   for noise_level in ${noise_levels[@]}; do
-  output_dir=results/only_first_step_${dataset}_${noise_level}_${num_steps}
+  output_dir=results/${model_name}_only_first_step_${dataset}_noise_${noise_level}_step_${num_steps}_rollout_${rollout_n}_guidance_${guidance_scale}_fixed_intial_noise
   python3 test_pipeline.py \
-    --world-size 1 \
+    --model-name ${model_name} \
+    --world-size 8 \
     --num-step ${num_steps} \
     --results-dir $output_dir \
-    --batch-size 32 \
+    --batch-size 4 \
+    --guidance-scale ${guidance_scale} \
+    --rollout-n ${rollout_n} \
     --noise-level ${noise_level} \
     --huggingface-dataset-split ${dataset}
+  bash scripts/compute_wer.sh $output_dir ${dataset}
   done
-  # bash scripts/compute_wer.sh $output_dir ${dataset}
   done
 fi

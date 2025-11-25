@@ -1,5 +1,5 @@
 wav_dir=$1
-wav_files=$(ls $wav_dir/*.wav)
+wav_files=$(ls -1 $wav_dir/*.wav | grep -v '[0-9]_[0-9]\+\.wav$')
 # if wav_files is empty, then exit
 if [ -z "$wav_files" ]; then
     exit 1

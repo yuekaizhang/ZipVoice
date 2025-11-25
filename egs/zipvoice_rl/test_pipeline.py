@@ -79,6 +79,24 @@ def get_parser():
         default=4,
         help="Number of steps for ZipVoice pipeline.",
     )
+    parser.add_argument(
+        "--rollout-n",
+        type=int,
+        default=1,
+        help="Number of rollouts for ZipVoice pipeline.",
+    )
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=1.0,
+        help="Guidance scale for ZipVoice pipeline.",
+    )
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="zipvoice_distill",
+        help="Model name for ZipVoice pipeline.",
+    )
     return parser
 
 
@@ -110,12 +128,11 @@ def run(rank, world_size, args):
         setup_dist(rank, world_size, args.master_port)
 
     device = torch.device("cuda", rank)
-    model_name = "zipvoice_distill"
 
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
 
-    pipeline = ZipVoicePipeline(model_name=model_name, device=device)
+    pipeline = ZipVoicePipeline(model_name=args.model_name, device=device)
     dataset_name = "yuekai/CV3-Eval" if 'zero' in args.huggingface_dataset_split else "yuekai/seed_tts_cosy2"
     dataset = load_dataset(
         dataset_name,
@@ -146,21 +163,79 @@ def run(rank, world_size, args):
     for batch in tqdm(data_loader, disable=rank != 0):
         ids, prompt_wavs_list, prompt_texts_list, target_texts_list = batch
 
-        output_wavs, log_prob, prev_sample_mean, std_dev_t = pipeline(
-            prompt_text=prompt_texts_list,
-            prompt_wav=prompt_wavs_list,
-            text=target_texts_list,
-            num_step=args.num_step,
-            enable_sde=True,
-            sde_noise_level=args.noise_level,
-        )
+        if args.rollout_n > 1:
+            all_rollout_wavs = []
+            all_rollout_rewards = []
+            all_rollout_transcripts = []
 
-        for i, wav in enumerate(output_wavs):
-            save_path = f"{args.results_dir}/{ids[i]}.wav"
-            torchaudio.save(save_path, wav.cpu(), sample_rate=pipeline.sampling_rate)
+            for rollout_idx in range(args.rollout_n):
+                output_wavs_rollout, _, _, _ = pipeline(
+                    prompt_text=prompt_texts_list,
+                    prompt_wav=prompt_wavs_list,
+                    text=target_texts_list,
+                    num_step=args.num_step,
+                    guidance_scale=args.guidance_scale,
+                    enable_sde=True,
+                    sde_noise_level=args.noise_level,
+                )
+                rewards_rollout, metadata = asr_reward_computation(
+                    output_wavs_rollout, target_texts_list
+                )
+                transcripts_rollout = metadata.get(
+                    "transcripts", [""] * len(output_wavs_rollout)
+                )
 
-        rewards, metadata = asr_reward_computation(output_wavs, target_texts_list)
-        transcripts = metadata.get("transcripts", [""] * len(output_wavs))
+                all_rollout_wavs.append(output_wavs_rollout)
+                all_rollout_rewards.append(rewards_rollout["asr_reward"])
+                all_rollout_transcripts.append(transcripts_rollout)
+
+            best_rewards_batch = []
+            best_transcripts_batch = []
+
+            # For each item in the batch
+            for i in range(len(ids)):
+                # Find the best rollout for this item
+                best_rollout_idx = np.argmax(
+                    [all_rollout_rewards[r][i] for r in range(args.rollout_n)]
+                )
+
+                # Save all wavs, renaming the best one
+                for r_idx in range(args.rollout_n):
+                    wav_to_save = all_rollout_wavs[r_idx][i]
+                    if r_idx == best_rollout_idx:
+                        save_path = f"{args.results_dir}/{ids[i]}.wav"
+                    else:
+                        save_path = f"{args.results_dir}/{ids[i]}_{r_idx}.wav"
+                    torchaudio.save(
+                        save_path,
+                        wav_to_save.cpu(),
+                        sample_rate=pipeline.sampling_rate,
+                    )
+
+                best_rewards_batch.append(all_rollout_rewards[best_rollout_idx][i])
+                best_transcripts_batch.append(
+                    all_rollout_transcripts[best_rollout_idx][i]
+                )
+
+            rewards = {"asr_reward": best_rewards_batch}
+            transcripts = best_transcripts_batch
+
+        else:
+            output_wavs, log_prob, prev_sample_mean, std_dev_t = pipeline(
+                prompt_text=prompt_texts_list,
+                prompt_wav=prompt_wavs_list,
+                text=target_texts_list,
+                num_step=args.num_step,
+                enable_sde=True,
+                sde_noise_level=args.noise_level,
+            )
+
+            rewards, metadata = asr_reward_computation(output_wavs, target_texts_list)
+            transcripts = metadata.get("transcripts", [""] * len(output_wavs))
+
+            for i, wav in enumerate(output_wavs):
+                save_path = f"{args.results_dir}/{ids[i]}.wav"
+                torchaudio.save(save_path, wav.cpu(), sample_rate=pipeline.sampling_rate)
 
         ids_list.extend(ids)
         target_texts_list_rank.extend(target_texts_list)

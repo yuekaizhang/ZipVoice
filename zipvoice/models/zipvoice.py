@@ -451,12 +451,14 @@ class ZipVoice(nn.Module):
             torch.zeros_like(speech_condition),
             speech_condition,
         )
-
+        generator = torch.Generator(device=text_condition.device)
+        generator.manual_seed(0)
         x0 = torch.randn(
             batch_size,
             num_frames,
             prompt_features.size(-1),
             device=text_condition.device,
+            generator=generator,
         )
         if enable_sde:
             x1, log_probs, latents, timesteps, prev_sample_means, std_dev_ts = self.solver.sample(

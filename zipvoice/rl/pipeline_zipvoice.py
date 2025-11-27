@@ -32,8 +32,9 @@ MODEL_DIR = {
 class ZipVoicePipeline(object):
     def __init__(
         self,
-        model_name: str,
-        model_path: Optional[str] = None,
+        model_name: str = None,
+        model_dir: Optional[str] = None,
+        checkpoint_name: Optional[str] = None,
         vocoder_path: Optional[str] = None,
         tokenizer_type: str = "emilia",
         lang: str = "en-us",
@@ -41,11 +42,12 @@ class ZipVoicePipeline(object):
     ):
         params = AttributeDict()
 
-        if model_path is not None:
-            params.model_dir = Path(model_path)
+        if model_dir is not None:
+            params.model_dir = Path(model_dir)
             if not params.model_dir.is_dir():
                 raise FileNotFoundError(f"{params.model_dir} does not exist")
-            checkpoint_name = "model.pt"
+            if checkpoint_name is None:
+                checkpoint_name = "model.pt"
             for filename in [checkpoint_name, "model.json", "tokens.txt"]:
                 if not (params.model_dir / filename).is_file():
                     raise FileNotFoundError(f"{params.model_dir / filename} does not exist")
@@ -158,6 +160,7 @@ class ZipVoicePipeline(object):
         feat_scale: float = 0.1,
         enable_sde: bool = True,
         sde_noise_level: float = 0.2,
+        enable_ln_sigma_sampling: bool = False,
     ) -> List[torch.Tensor]:
         if num_step is None:
             num_step = self.defaults.get("num_step", 16)
@@ -189,6 +192,7 @@ class ZipVoicePipeline(object):
             guidance_scale=guidance_scale,
             enable_sde=enable_sde,
             sde_noise_level=sde_noise_level,
+            enable_ln_sigma_sampling=enable_ln_sigma_sampling,
         )
 
         if enable_sde:

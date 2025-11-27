@@ -79,6 +79,49 @@ fi
 
 ### Training ZipVoice (5 - 6)
 
+if [ $stage -le 41 ] && [ $stop_stage -ge 41 ]; then
+    echo "Stage 4: Run inference"
+    model_dir=exp/zipvoice_finetune
+    model_dir=exp/zipvoice_finetune_ln_sigma
+    python3 -m zipvoice.bin.infer_zipvoice_trt \
+        --model-dir $model_dir \
+        --checkpoint-name epoch-1.pt \
+        --huggingface-dataset-name yuekai/seed_tts_cosy2 \
+        --huggingface-dataset-split wenetspeech4tts \
+        --batch-size 8 \
+        --num-step 16 \
+        --res-dir results_${model_dir}
+fi
+
+if [ $stage -le 42 ] && [ $stop_stage -ge 42 ]; then
+  echo "stage 11: Test the model"
+  datasets=(wenetspeech4tts zero_shot_zh test_zh)
+  datasets=(zero_shot_zh)
+  datasets=(wenetspeech4tts)
+  model_dir=exp/zipvoice_finetune_ln_sigma
+  for dataset in ${datasets[@]}; do
+
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+  guidance_scale=1.0
+  model_name=zipvoice
+  num_steps=16
+  rollout_n=8
+  enable_ln_sigma_sampling=True
+  output_dir=results/${model_dir}_${dataset}_rollout_${rollout_n}
+  python3 test_pipeline.py \
+    --model-dir $model_dir \
+    --checkpoint-name epoch-3.pt \
+    --rollout-n ${rollout_n} \
+    --enable-ln-sigma-sampling  \
+    --huggingface-dataset-split ${dataset} \
+    --batch-size 8 \
+    --num-step 16 \
+    --model-name ${model_name} \
+    --results-dir results_${model_dir}
+  done
+fi
+
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
       echo "Stage 5: Fine-tune the ZipVoice model"
 
@@ -98,10 +141,62 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
             --tokenizer ${tokenizer} \
             --lang ${lang} \
             --token-file ${download_dir}/zipvoice/tokens.txt \
-            --dataset custom \
-            --train-manifest data/fbank/custom-finetune_cuts_train.jsonl.gz \
-            --dev-manifest data/fbank/custom-finetune_cuts_dev.jsonl.gz \
+            --dataset aishell3 \
+            --on-the-fly-feats True \
             --exp-dir exp/zipvoice_finetune
+
+fi
+
+if [ ${stage} -le 50 ] && [ ${stop_stage} -ge 50 ]; then
+      echo "Stage 50: Fine-tune the ZipVoice model with ln_sigma head"
+
+      [ -z "$max_len" ] && { echo "Error: max_len is not set!" >&2; exit 1; }
+
+      python3 -m zipvoice.bin.train_zipvoice \
+            --world-size 4 \
+            --use-fp16 1 \
+            --finetune 1 \
+            --base-lr 0.0001 \
+            --num-iters 10000 \
+            --save-every-n 1000 \
+            --max-duration 500 \
+            --max-len ${max_len} \
+            --model-config ${download_dir}/zipvoice/model.json \
+            --checkpoint ${download_dir}/zipvoice/model.pt \
+            --tokenizer ${tokenizer} \
+            --lang ${lang} \
+            --token-file ${download_dir}/zipvoice/tokens.txt \
+            --dataset aishell3 \
+            --on-the-fly-feats True \
+            --enable-ln-sigma-head True \
+            --only-train-ln-sigma-head True \
+            --exp-dir exp/zipvoice_finetune_ln_sigma
+
+fi
+
+if [ ${stage} -le 51 ] && [ ${stop_stage} -ge 51 ]; then
+      echo "Stage 51: Fine-tune the ZipVoice model with ln_sigma head"
+
+      [ -z "$max_len" ] && { echo "Error: max_len is not set!" >&2; exit 1; }
+
+      python3 -m zipvoice.bin.train_zipvoice \
+            --world-size 4 \
+            --use-fp16 1 \
+            --finetune 1 \
+            --base-lr 0.0001 \
+            --num-iters 10000 \
+            --save-every-n 1000 \
+            --max-duration 500 \
+            --max-len ${max_len} \
+            --model-config ${download_dir}/zipvoice/model.json \
+            --checkpoint exp/zipvoice_finetune_ln_sigma/epoch-1.pt \
+            --tokenizer ${tokenizer} \
+            --lang ${lang} \
+            --token-file ${download_dir}/zipvoice/tokens.txt \
+            --dataset aishell3 \
+            --on-the-fly-feats True \
+            --enable-ln-sigma-head True \
+            --exp-dir exp/zipvoice_finetune_ln_sigma
 
 fi
 
@@ -168,7 +263,7 @@ if [ $stage -le 10 ] && [ $stop_stage -ge 10 ]; then
 #   cd /workspace/PytritonSenseVoice
 #   pip install -e .
   # pip install jiwer WeTextProcessing wandb zhon sherpa-onnx
-  n_gpus=8
+  n_gpus=1
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 reward_server.py --number-of-devices $n_gpus
 
 fi 

@@ -298,6 +298,20 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--enable-ln-sigma-head",
+        type=str2bool,
+        default=False,
+        help="Whether to enable the ln_sigma head in the model.",
+    )
+
+    parser.add_argument(
+        "--only-train-ln-sigma-head",
+        type=str2bool,
+        default=False,
+        help="Whether to only train the ln_sigma head, requires --enable-ln-sigma-head.",
+    )
+
+    parser.add_argument(
         "--condition-drop-ratio",
         type=float,
         default=0.2,
@@ -308,7 +322,7 @@ def get_parser():
         "--dataset",
         type=str,
         default="emilia",
-        choices=["emilia", "libritts", "custom"],
+        choices=["emilia", "libritts", "custom", "aishell3"],
         help="The used training dataset",
     )
 
@@ -369,6 +383,12 @@ def get_parser():
         "which is a text file with '{token}\t{token_id}' per line.",
     )
 
+    parser.add_argument(
+        "--on-the-fly-tokenization",
+        type=str2bool,
+        default=False,
+        help="Whether to tokenize the text on-the-fly, which can slow down training significantly.",
+    )
     return parser
 
 
@@ -493,6 +513,7 @@ def train_one_epoch(
     train_dl: torch.utils.data.DataLoader,
     valid_dl: torch.utils.data.DataLoader,
     scaler: GradScaler,
+    tokenizer,
     model_avg: Optional[nn.Module] = None,
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
@@ -568,6 +589,7 @@ def train_one_epoch(
                 params=params,
                 model=model,
                 valid_dl=valid_dl,
+                tokenizer=tokenizer,
                 world_size=world_size,
             )
             model.train()
@@ -592,6 +614,7 @@ def train_one_epoch(
             params=params,
             batch=batch,
             device=device,
+            tokenizer=tokenizer,
             return_tokens=True,
             return_feature=True,
         )
@@ -725,6 +748,7 @@ def compute_validation_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
     valid_dl: torch.utils.data.DataLoader,
+    tokenizer,
     world_size: int = 1,
 ) -> MetricsTracker:
     """Run the validation process."""
@@ -740,6 +764,7 @@ def compute_validation_loss(
             params=params,
             batch=batch,
             device=device,
+            tokenizer=tokenizer,
             return_tokens=True,
             return_feature=True,
         )
@@ -800,6 +825,7 @@ def scan_pessimistic_batches_for_oom(
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     params: AttributeDict,
+    tokenizer,
 ):
     from lhotse.dataset import find_pessimistic_batches
 
@@ -815,6 +841,7 @@ def scan_pessimistic_batches_for_oom(
             params=params,
             batch=batch,
             device=device,
+            tokenizer=tokenizer,
             return_tokens=True,
             return_feature=True,
         )
@@ -877,6 +904,7 @@ def run(rank, world_size, args):
         params.num_epochs = 1000000
     with open(params.model_config, "r") as f:
         model_config = json.load(f)
+    model_config["model"]["enable_ln_sigma_head"] = params.enable_ln_sigma_head
     params.update(model_config["model"])
     params.update(model_config["feature"])
 
@@ -885,7 +913,8 @@ def run(rank, world_size, args):
         setup_dist(rank, world_size, params.master_port)
 
     os.makedirs(f"{params.exp_dir}", exist_ok=True)
-    copyfile(src=params.model_config, dst=f"{params.exp_dir}/model.json")
+    with open(f"{params.exp_dir}/model.json", "w") as f:
+        json.dump(model_config, f, indent=4)
     copyfile(src=params.token_file, dst=f"{params.exp_dir}/tokens.txt")
     setup_logger(f"{params.exp_dir}/log/log-train")
 
@@ -924,7 +953,11 @@ def run(rank, world_size, args):
 
     if params.checkpoint is not None:
         logging.info(f"Loading pre-trained model from {params.checkpoint}")
-        _ = load_checkpoint(filename=params.checkpoint, model=model, strict=True)
+        _ = load_checkpoint(
+            filename=params.checkpoint,
+            model=model,
+            strict=(not params.get("enable_ln_sigma_head", False)),
+        )
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of parameters : {num_param}")
 
@@ -941,6 +974,17 @@ def run(rank, world_size, args):
     if world_size > 1:
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+
+    if params.only_train_ln_sigma_head:
+        assert (
+            params.enable_ln_sigma_head
+        ), "--only-train-ln-sigma-head requires --enable-ln-sigma-head"
+        logging.info("Freezing all parameters except for the ln_sigma head.")
+        for name, param in model.named_parameters():
+            if "fm_decoder.out_proj_ln_sigma" not in name:
+                param.requires_grad = False
+            else:
+                logging.info(f"Training parameter: {name}")
 
     optimizer = ScaledAdam(
         get_parameter_groups_with_lrs(
@@ -1009,6 +1053,10 @@ def run(rank, world_size, args):
             datamodule.dev_emilia_ZH_cuts(),
             weights=[0.5, 0.5],
         )
+    elif params.dataset == "aishell3":
+        train_cuts = datamodule.train_cuts_aishell3()
+        train_cuts = train_cuts.filter(_remove_short_and_long_utt)
+        dev_cuts = datamodule.dev_cuts_aishell3()
     elif params.dataset == "libritts":
         train_cuts = datamodule.train_libritts_cuts()
         train_cuts = train_cuts.filter(_remove_short_and_long_utt)
@@ -1029,13 +1077,17 @@ def run(rank, world_size, args):
                 f"Using {params.tokenizer} tokenizer but tokens are not prepared,"
                 f"will tokenize on-the-fly, which can slow down training significantly."
             )
-    _tokenize_text = partial(tokenize_text, tokenizer=tokenizer)
-    train_cuts = train_cuts.map(_tokenize_text)
-    dev_cuts = dev_cuts.map(_tokenize_text)
+    # if return_tokens, we need to pre-compute the tokens then attach the tokens into the cuts
+    # below code will then do token2token_ids
+    # if not return_tokens, we will compute use text2token_ids in the forward pass
+    # This only for quick testing, not for production
+    if not params.on_the_fly_tokenization:
+        _tokenize_text = partial(tokenize_text, tokenizer=tokenizer)
+        train_cuts = train_cuts.map(_tokenize_text)
+        dev_cuts = dev_cuts.map(_tokenize_text)
 
-    train_dl = datamodule.train_dataloaders(train_cuts)
-
-    valid_dl = datamodule.dev_dataloaders(dev_cuts)
+    train_dl = datamodule.train_dataloaders(train_cuts, return_tokens=not params.on_the_fly_tokenization)
+    valid_dl = datamodule.dev_dataloaders(dev_cuts, return_tokens=not params.on_the_fly_tokenization)
 
     if params.scan_oom:
         scan_pessimistic_batches_for_oom(
@@ -1043,6 +1095,7 @@ def run(rank, world_size, args):
             train_dl=train_dl,
             optimizer=optimizer,
             params=params,
+            tokenizer=tokenizer,
         )
 
     logging.info("Training started")
@@ -1069,6 +1122,7 @@ def run(rank, world_size, args):
             train_dl=train_dl,
             valid_dl=valid_dl,
             scaler=scaler,
+            tokenizer=tokenizer,
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,

@@ -155,6 +155,7 @@ class TtsDataModule:
         self,
         cuts_train: CutSet,
         sampler_state_dict: Optional[Dict[str, Any]] = None,
+        return_tokens: bool = True,
     ) -> DataLoader:
         """
         Args:
@@ -167,7 +168,7 @@ class TtsDataModule:
 
         train = SpeechSynthesisDataset(
             return_text=True,
-            return_tokens=True,
+            return_tokens=return_tokens,
             return_spk_ids=True,
             feature_input_strategy=OnTheFlyFeatures(VocosFbank())
             if self.args.on_the_fly_feats
@@ -215,11 +216,11 @@ class TtsDataModule:
 
         return train_dl
 
-    def dev_dataloaders(self, cuts_valid: CutSet) -> DataLoader:
+    def dev_dataloaders(self, cuts_valid: CutSet, return_tokens: bool = True) -> DataLoader:
         logging.info("About to create dev dataset")
         validate = SpeechSynthesisDataset(
             return_text=True,
-            return_tokens=True,
+            return_tokens=return_tokens,
             return_spk_ids=True,
             feature_input_strategy=OnTheFlyFeatures(VocosFbank())
             if self.args.on_the_fly_feats
@@ -242,11 +243,11 @@ class TtsDataModule:
 
         return dev_dl
 
-    def test_dataloaders(self, cuts: CutSet) -> DataLoader:
+    def test_dataloaders(self, cuts: CutSet, return_tokens: bool = True) -> DataLoader:
         logging.info("About to create test dataset")
         test = SpeechSynthesisDataset(
             return_text=True,
-            return_tokens=True,
+            return_tokens=return_tokens,
             return_spk_ids=True,
             feature_input_strategy=OnTheFlyFeatures(VocosFbank())
             if self.args.on_the_fly_feats

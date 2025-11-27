@@ -97,6 +97,28 @@ def get_parser():
         default="zipvoice_distill",
         help="Model name for ZipVoice pipeline.",
     )
+    parser.add_argument(
+        "--model-dir",
+        type=str,
+        default=None,
+        help="Model directory for ZipVoice pipeline.",
+    )
+    parser.add_argument(
+        "--checkpoint-name",
+        type=str,
+        default="epoch-1.pt",
+        help="Checkpoint name for ZipVoice pipeline.",
+    )   
+    parser.add_argument(
+        "--enable-sde",
+        action="store_true",
+        help="Enable SDE-based sampling.",
+    )
+    parser.add_argument(
+        "--enable-ln-sigma-sampling",
+        action="store_true",
+        help="Enable sampling with ln_sigma.",
+    )
     return parser
 
 
@@ -131,8 +153,12 @@ def run(rank, world_size, args):
 
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
-
-    pipeline = ZipVoicePipeline(model_name=args.model_name, device=device)
+    model_dir = args.model_dir
+    checkpoint_name = args.checkpoint_name
+    if model_dir is not None:
+        pipeline = ZipVoicePipeline(model_name=args.model_name, model_dir=model_dir, checkpoint_name=checkpoint_name, device=device)
+    else:
+        pipeline = ZipVoicePipeline(model_name=args.model_name, device=device)
     dataset_name = "yuekai/CV3-Eval" if 'zero' in args.huggingface_dataset_split else "yuekai/seed_tts_cosy2"
     dataset = load_dataset(
         dataset_name,
@@ -169,15 +195,21 @@ def run(rank, world_size, args):
             all_rollout_transcripts = []
 
             for rollout_idx in range(args.rollout_n):
-                output_wavs_rollout, _, _, _ = pipeline(
+                pipeline_output = pipeline(
                     prompt_text=prompt_texts_list,
                     prompt_wav=prompt_wavs_list,
                     text=target_texts_list,
                     num_step=args.num_step,
                     guidance_scale=args.guidance_scale,
-                    enable_sde=True,
+                    enable_sde=args.enable_sde,
                     sde_noise_level=args.noise_level,
+                    enable_ln_sigma_sampling=args.enable_ln_sigma_sampling,
                 )
+                if args.enable_sde:
+                    output_wavs_rollout, _, _, _ = pipeline_output
+                else:
+                    output_wavs_rollout = pipeline_output
+
                 rewards_rollout, metadata = asr_reward_computation(
                     output_wavs_rollout, target_texts_list
                 )
@@ -221,14 +253,19 @@ def run(rank, world_size, args):
             transcripts = best_transcripts_batch
 
         else:
-            output_wavs, log_prob, prev_sample_mean, std_dev_t = pipeline(
+            pipeline_output = pipeline(
                 prompt_text=prompt_texts_list,
                 prompt_wav=prompt_wavs_list,
                 text=target_texts_list,
                 num_step=args.num_step,
-                enable_sde=True,
+                enable_sde=args.enable_sde,
                 sde_noise_level=args.noise_level,
+                enable_ln_sigma_sampling=args.enable_ln_sigma_sampling,
             )
+            if args.enable_sde:
+                output_wavs, _, _, _ = pipeline_output
+            else:
+                output_wavs = pipeline_output
 
             rewards, metadata = asr_reward_computation(output_wavs, target_texts_list)
             transcripts = metadata.get("transcripts", [""] * len(output_wavs))

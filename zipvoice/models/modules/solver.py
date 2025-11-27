@@ -124,7 +124,7 @@ class DiffusionModel(torch.nn.Module):
                 text_condition=text_condition,
                 speech_condition=speech_condition,
                 padding_mask=padding_mask,
-                **kwargs
+                **kwargs,
             )
         else:
             assert t.dim() == 0
@@ -146,17 +146,29 @@ class DiffusionModel(torch.nn.Module):
                     [speech_condition, speech_condition], dim=0
                 )
 
-            data_uncond, data_cond = self.model_func(
+            model_out = self.model_func(
                 t=t,
                 xt=x,
                 text_condition=text_condition,
                 speech_condition=speech_condition,
                 padding_mask=padding_mask,
-                **kwargs
-            ).chunk(2, dim=0)
+                **kwargs,
+            )
+            if self.model.enable_ln_sigma_head:
+                data, ln_sigma = model_out
+                data_uncond, data_cond = data.chunk(2, dim=0)
+                _, ln_sigma_cond = ln_sigma.chunk(2, dim=0)
 
-            res = (1 + guidance_scale) * data_cond - guidance_scale * data_uncond
-            return res
+                res_data = (
+                    1 + guidance_scale
+                ) * data_cond - guidance_scale * data_uncond
+                # Use the conditional sigma for guidance
+                res_ln_sigma = ln_sigma_cond
+                return res_data, res_ln_sigma
+            else:
+                data_uncond, data_cond = model_out.chunk(2, dim=0)
+                res = (1 + guidance_scale) * data_cond - guidance_scale * data_uncond
+                return res
 
 
 class DistillDiffusionModel(DiffusionModel):
@@ -302,6 +314,7 @@ class EulerSolver:
         t_shift: float = 1.0,
         enable_sde: bool = False,
         sde_noise_level: float = 0.1,
+        enable_ln_sigma_sampling: bool = False,
         **kwargs
     ) -> torch.Tensor:
         """
@@ -344,15 +357,28 @@ class EulerSolver:
         std_dev_ts = []
 
         for step in range(num_step):
-            v = self.model(
+            model_out = self.model(
                 t=timesteps[step],
                 x=x,
                 text_condition=text_condition,
                 speech_condition=speech_condition,
                 padding_mask=padding_mask,
                 guidance_scale=guidance_scale,
-                **kwargs
+                **kwargs,
             )
+            if enable_ln_sigma_sampling:
+                assert (
+                    self.model.model.enable_ln_sigma_head
+                ), "enable_ln_sigma_sampling requires model with ln_sigma head"
+                v, ln_sigma = model_out
+                snd = torch.randn_like(v)
+                v = v + snd * torch.exp(ln_sigma)
+            else:
+                if self.model.model.enable_ln_sigma_head:
+                    v, _ = model_out
+                else:
+                    v = model_out
+
             # last step, use the original sample
             if enable_sde and step == 0:
                 x, log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
@@ -368,7 +394,7 @@ class EulerSolver:
                 std_dev_ts.append(std_dev_t)
             else:
                 x = x + v * (timesteps[step + 1] - timesteps[step])
-            
+
         if enable_sde:
             return x, log_probs, latents, timesteps, prev_sample_means, std_dev_ts
         else:

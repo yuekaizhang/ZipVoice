@@ -127,6 +127,7 @@ class TTSZipformer(nn.Module):
         use_guidance_scale_embed: bool = False,
         guidance_scale_embed_dim: int = 192,
         use_conv: bool = True,
+        enable_ln_sigma_head: bool = False,
     ) -> None:
         super(TTSZipformer, self).__init__()
 
@@ -168,6 +169,7 @@ class TTSZipformer(nn.Module):
 
         self.use_time_embed = use_time_embed
         self.use_guidance_scale_embed = use_guidance_scale_embed
+        self.enable_ln_sigma_head = enable_ln_sigma_head
 
         self.time_embed_dim = time_embed_dim
         if self.use_time_embed:
@@ -178,6 +180,11 @@ class TTSZipformer(nn.Module):
 
         self.in_proj = nn.Linear(in_dim, encoder_dim)
         self.out_proj = nn.Linear(encoder_dim, out_dim)
+        if self.enable_ln_sigma_head:
+            self.out_proj_ln_sigma = nn.Linear(encoder_dim, out_dim)
+            nn.init.zeros_(self.out_proj_ln_sigma.weight)
+            if self.out_proj_ln_sigma.bias is not None:
+                nn.init.zeros_(self.out_proj_ln_sigma.bias)
 
         # each one will be Zipformer2Encoder or DownsampledZipformer2Encoder
         encoders = []
@@ -245,7 +252,7 @@ class TTSZipformer(nn.Module):
         t: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         guidance_scale: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """
         Args:
           x:
@@ -288,9 +295,17 @@ class TTSZipformer(nn.Module):
                 src_key_padding_mask=padding_mask,
                 attn_mask=attn_mask,
             )
-        x = self.out_proj(x)
-        x = x.permute(1, 0, 2)
-        return x
+        encoder_out = x
+        mu = self.out_proj(encoder_out)
+
+        if self.enable_ln_sigma_head:
+            ln_sigma = self.out_proj_ln_sigma(encoder_out)
+            mu = mu.permute(1, 0, 2)
+            ln_sigma = ln_sigma.permute(1, 0, 2)
+            return mu, ln_sigma
+        else:
+            mu = mu.permute(1, 0, 2)
+            return mu
 
 
 def _whitening_schedule(x: float, ratio: float = 2.0) -> ScheduledFloat:

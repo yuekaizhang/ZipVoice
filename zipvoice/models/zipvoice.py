@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -57,6 +57,7 @@ class ZipVoice(nn.Module):
         feat_dim: int = 100,
         vocab_size: int = 26,
         pad_id: int = 0,
+        enable_ln_sigma_head: bool = False,
     ):
         """
         Initialize the model with specified configuration parameters.
@@ -107,6 +108,7 @@ class ZipVoice(nn.Module):
             pos_dim=pos_dim,
             use_time_embed=True,
             time_embed_dim=time_embed_dim,
+            enable_ln_sigma_head=enable_ln_sigma_head,
         )
 
         self.text_encoder = TTSZipformer(
@@ -128,6 +130,7 @@ class ZipVoice(nn.Module):
         self.feat_dim = feat_dim
         self.text_embed_dim = text_embed_dim
         self.pad_id = pad_id
+        self.enable_ln_sigma_head = enable_ln_sigma_head
 
         self.embed = nn.Embedding(vocab_size, text_embed_dim)
         self.solver = EulerSolver(self, func_name="forward_fm_decoder")
@@ -140,7 +143,7 @@ class ZipVoice(nn.Module):
         speech_condition: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         guidance_scale: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Compute velocity.
         Args:
             t:  A tensor of shape (N, 1, 1) or a tensor of a float,
@@ -177,12 +180,18 @@ class ZipVoice(nn.Module):
             if guidance_scale.dim() == 0:
                 guidance_scale = guidance_scale.repeat(xt.shape[0])
 
-            vt = self.fm_decoder(
+            decoder_out = self.fm_decoder(
                 x=xt, t=t, padding_mask=padding_mask, guidance_scale=guidance_scale
             )
         else:
-            vt = self.fm_decoder(x=xt, t=t, padding_mask=padding_mask)
-        return vt
+            decoder_out = self.fm_decoder(x=xt, t=t, padding_mask=padding_mask)
+
+        if self.enable_ln_sigma_head:
+            vt, ln_sigma = decoder_out
+            return vt, ln_sigma
+        else:
+            vt = decoder_out
+            return vt
 
     def forward_text_embed(
         self,
@@ -372,7 +381,7 @@ class ZipVoice(nn.Module):
         xt = features * t + noise * (1 - t)
         ut = features - noise  # (B, T, F)
 
-        vt = self.forward_fm_decoder(
+        fm_decoder_out = self.forward_fm_decoder(
             t=t,
             xt=xt,
             text_condition=text_condition,
@@ -381,7 +390,20 @@ class ZipVoice(nn.Module):
         )
 
         loss_mask = speech_condition_mask & (~padding_mask)
-        fm_loss = torch.mean((vt[loss_mask] - ut[loss_mask]) ** 2)
+        if self.enable_ln_sigma_head:
+            # The loss is from readme.md
+            # loss = F.mse_loss(mu, flow, reduction='none') / (2 * (torch.exp(ln_sig) ** 2) + 1e-6) + ln_sig
+            # loss += (t * t) * ln_sig
+            # mu -> vt, flow -> ut, ln_sig -> ln_sigma
+            vt, ln_sigma = fm_decoder_out
+            mse = (vt - ut) ** 2
+            denominator = 2 * torch.exp(2 * ln_sigma) + 1e-6
+            loss_dist = mse / denominator + ln_sigma
+            loss_dist += (t**2) * ln_sigma
+            fm_loss = torch.mean(loss_dist[loss_mask])
+        else:
+            vt = fm_decoder_out
+            fm_loss = torch.mean((vt[loss_mask] - ut[loss_mask]) ** 2)
 
         return fm_loss
 
@@ -399,6 +421,7 @@ class ZipVoice(nn.Module):
         guidance_scale: float = 0.5,
         enable_sde: bool = False,
         sde_noise_level: float = 0.1,
+        enable_ln_sigma_sampling: bool = False,
     ) -> torch.Tensor:
         """
         Generate acoustic features, given text tokens, prompts feature
@@ -471,6 +494,7 @@ class ZipVoice(nn.Module):
                 t_shift=t_shift,
                 enable_sde=enable_sde,
                 sde_noise_level=sde_noise_level,
+                enable_ln_sigma_sampling=enable_ln_sigma_sampling,
             )
         else:
             x1 = self.solver.sample(
@@ -481,6 +505,7 @@ class ZipVoice(nn.Module):
                 num_step=num_step,
                 guidance_scale=guidance_scale,
                 t_shift=t_shift,
+                enable_ln_sigma_sampling=enable_ln_sigma_sampling,
             )
         x1_wo_prompt_lens = (~padding_mask).sum(-1) - prompt_features_lens
         x1_prompt = torch.zeros(
@@ -514,6 +539,7 @@ class ZipVoice(nn.Module):
         t_end: float,
         num_step: int = 1,
         guidance_scale: torch.Tensor = None,
+        enable_ln_sigma_sampling: bool = False,
     ) -> torch.Tensor:
         """
         Generate acoustic features in intermediate timesteps.
@@ -547,6 +573,7 @@ class ZipVoice(nn.Module):
             guidance_scale=guidance_scale,
             t_start=t_start,
             t_end=t_end,
+            enable_ln_sigma_sampling=enable_ln_sigma_sampling,
         )
         x_t_end_lens = (~padding_mask).sum(-1)
         return x_t_end, x_t_end_lens

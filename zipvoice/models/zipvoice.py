@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -143,7 +143,7 @@ class ZipVoice(nn.Module):
         speech_condition: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         guidance_scale: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Compute velocity.
         Args:
             t:  A tensor of shape (N, 1, 1) or a tensor of a float,
@@ -187,8 +187,8 @@ class ZipVoice(nn.Module):
             decoder_out = self.fm_decoder(x=xt, t=t, padding_mask=padding_mask)
 
         if self.enable_ln_sigma_head:
-            vt, ln_sigma = decoder_out
-            return vt, ln_sigma
+            vt, ln_sigma, v = decoder_out
+            return vt, ln_sigma, v
         else:
             vt = decoder_out
             return vt
@@ -395,7 +395,7 @@ class ZipVoice(nn.Module):
             # loss = F.mse_loss(mu, flow, reduction='none') / (2 * (torch.exp(ln_sig) ** 2) + 1e-6) + ln_sig
             # loss += (t * t) * ln_sig
             # mu -> vt, flow -> ut, ln_sig -> ln_sigma
-            vt, ln_sigma = fm_decoder_out
+            vt, ln_sigma, v = fm_decoder_out
             mse = (vt - ut) ** 2
             denominator = 2 * torch.exp(2 * ln_sigma) + 1e-6
             loss_dist = mse / denominator + ln_sigma

@@ -302,7 +302,10 @@ class TTSZipformer(nn.Module):
             ln_sigma = self.out_proj_ln_sigma(encoder_out)
             mu = mu.permute(1, 0, 2)
             ln_sigma = ln_sigma.permute(1, 0, 2)
-            return mu, ln_sigma
+
+            snd = torch.randn_like(mu)
+            v = mu + snd * torch.exp(ln_sigma)
+            return mu, ln_sigma, v
         else:
             mu = mu.permute(1, 0, 2)
             return mu

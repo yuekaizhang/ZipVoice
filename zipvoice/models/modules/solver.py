@@ -154,17 +154,13 @@ class DiffusionModel(torch.nn.Module):
                 padding_mask=padding_mask,
                 **kwargs,
             )
-            if self.model.enable_ln_sigma_head:
-                data, ln_sigma = model_out
-                data_uncond, data_cond = data.chunk(2, dim=0)
-                _, ln_sigma_cond = ln_sigma.chunk(2, dim=0)
-
-                res_data = (
+            if self.model.model.enable_ln_sigma_head:
+                _, _, v = model_out
+                v_uncond, v_cond = v.chunk(2, dim=0)
+                res = (
                     1 + guidance_scale
-                ) * data_cond - guidance_scale * data_uncond
-                # Use the conditional sigma for guidance
-                res_ln_sigma = ln_sigma_cond
-                return res_data, res_ln_sigma
+                ) * v_cond - guidance_scale * v_uncond
+                return res
             else:
                 data_uncond, data_cond = model_out.chunk(2, dim=0)
                 res = (1 + guidance_scale) * data_cond - guidance_scale * data_uncond
@@ -366,18 +362,7 @@ class EulerSolver:
                 guidance_scale=guidance_scale,
                 **kwargs,
             )
-            if enable_ln_sigma_sampling:
-                assert (
-                    self.model.model.enable_ln_sigma_head
-                ), "enable_ln_sigma_sampling requires model with ln_sigma head"
-                v, ln_sigma = model_out
-                snd = torch.randn_like(v)
-                v = v + snd * torch.exp(ln_sigma)
-            else:
-                if self.model.model.enable_ln_sigma_head:
-                    v, _ = model_out
-                else:
-                    v = model_out
+            v = model_out
 
             # last step, use the original sample
             if enable_sde and step == 0:

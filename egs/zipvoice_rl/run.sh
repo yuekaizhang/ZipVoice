@@ -98,27 +98,28 @@ if [ $stage -le 42 ] && [ $stop_stage -ge 42 ]; then
   datasets=(wenetspeech4tts zero_shot_zh test_zh)
   datasets=(zero_shot_zh)
   datasets=(wenetspeech4tts)
-  model_dir=exp/zipvoice_finetune_ln_sigma
+  datasets=(test_en)
+  model_dir=exp/zipvoice_libritts_p_no_zero_init 
   for dataset in ${datasets[@]}; do
 
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
   guidance_scale=1.0
   model_name=zipvoice
-  num_steps=16
-  rollout_n=8
+  num_steps=32
+  rollout_n=4
   enable_ln_sigma_sampling=True
-  output_dir=results/${model_dir}_${dataset}_rollout_${rollout_n}
+  # output_dir=results/${model_dir}_${dataset}_rollout_${rollout_n}_temperature_1.5
   python3 test_pipeline.py \
     --model-dir $model_dir \
-    --checkpoint-name epoch-3.pt \
+    --checkpoint-name epoch-40.pt \
     --rollout-n ${rollout_n} \
     --enable-ln-sigma-sampling  \
     --huggingface-dataset-split ${dataset} \
-    --batch-size 8 \
-    --num-step 16 \
+    --batch-size 2 \
+    --num-step $num_steps \
     --model-name ${model_name} \
-    --results-dir results_${model_dir}
+    --results-dir results_${model_dir}_temperature_0_exp_32_total_steps
   done
 fi
 
@@ -262,7 +263,7 @@ if [ $stage -le 10 ] && [ $stop_stage -ge 10 ]; then
 #   git clone https://github.com/yuekaizhang/PytritonSenseVoice.git /workspace/PytritonSenseVoice
 #   cd /workspace/PytritonSenseVoice
 #   pip install -e .
-  # pip install jiwer WeTextProcessing wandb zhon sherpa-onnx
+  # pip install jiwer WeTextProcessing wandb zhon sherpa-onnx kaldialign
   n_gpus=1
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 reward_server.py --number-of-devices $n_gpus
 

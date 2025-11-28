@@ -30,7 +30,7 @@ REWARD_SERVER_URL = "http://localhost:8000/v2/models/asr_reward/infer"
 
 
 def asr_reward_computation(
-    wavs: List[torch.Tensor], texts: List[str], timeout: float = 200.0
+    wavs: List[torch.Tensor], texts: List[str], timeout: float = 20.0
 ) -> (dict, dict):
     """
     Send wavs and ground-truth texts to the Triton server and get reward.

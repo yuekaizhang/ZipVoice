@@ -182,9 +182,9 @@ class TTSZipformer(nn.Module):
         self.out_proj = nn.Linear(encoder_dim, out_dim)
         if self.enable_ln_sigma_head:
             self.out_proj_ln_sigma = nn.Linear(encoder_dim, out_dim)
-            nn.init.zeros_(self.out_proj_ln_sigma.weight)
-            if self.out_proj_ln_sigma.bias is not None:
-                nn.init.zeros_(self.out_proj_ln_sigma.bias)
+            # nn.init.zeros_(self.out_proj_ln_sigma.weight)
+            # if self.out_proj_ln_sigma.bias is not None:
+            #     nn.init.zeros_(self.out_proj_ln_sigma.bias)
 
         # each one will be Zipformer2Encoder or DownsampledZipformer2Encoder
         encoders = []
@@ -304,7 +304,19 @@ class TTSZipformer(nn.Module):
             ln_sigma = ln_sigma.permute(1, 0, 2)
 
             snd = torch.randn_like(mu)
-            v = mu + snd * torch.exp(ln_sigma)
+
+            if t[0] < 0.01:
+                temperature = 40
+            else:
+                temperature = 1
+            temperature = 0
+            # T_start = 10
+            # T_end = 0.1
+            # t_now = t[0]
+            # # temperature = T_end + 0.5 * (T_start - T_end) * (1 + torch.cos(math.pi * t_now))
+            # temperature = T_start * (T_end / T_start) ** t_now
+
+            v = mu + snd * torch.exp(ln_sigma) * temperature
             return mu, ln_sigma, v
         else:
             mu = mu.permute(1, 0, 2)

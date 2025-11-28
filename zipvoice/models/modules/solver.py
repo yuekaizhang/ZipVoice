@@ -154,7 +154,7 @@ class DiffusionModel(torch.nn.Module):
                 padding_mask=padding_mask,
                 **kwargs,
             )
-            if self.model.model.enable_ln_sigma_head:
+            if self.model.enable_ln_sigma_head:
                 _, _, v = model_out
                 v_uncond, v_cond = v.chunk(2, dim=0)
                 res = (

@@ -156,7 +156,8 @@ def run(rank, world_size, args):
     model_dir = args.model_dir
     checkpoint_name = args.checkpoint_name
     if model_dir is not None:
-        pipeline = ZipVoicePipeline(model_name=args.model_name, model_dir=model_dir, checkpoint_name=checkpoint_name, device=device)
+        tokenizer_type = "libritts" if "libritts" in model_dir else "emilia"
+        pipeline = ZipVoicePipeline(model_name=args.model_name, model_dir=model_dir, checkpoint_name=checkpoint_name, tokenizer_type=tokenizer_type, device=device)
     else:
         pipeline = ZipVoicePipeline(model_name=args.model_name, device=device)
     dataset_name = "yuekai/CV3-Eval" if 'zero' in args.huggingface_dataset_split else "yuekai/seed_tts_cosy2"
@@ -165,6 +166,8 @@ def run(rank, world_size, args):
         split=args.huggingface_dataset_split,
         trust_remote_code=True,
     )
+    # only select the first 20 items
+    dataset = dataset.select(range(20))
 
     sampler = None
     if world_size > 1:

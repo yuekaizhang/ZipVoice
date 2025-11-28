@@ -263,7 +263,7 @@ if [ $stage -le 10 ] && [ $stop_stage -ge 10 ]; then
 #   git clone https://github.com/yuekaizhang/PytritonSenseVoice.git /workspace/PytritonSenseVoice
 #   cd /workspace/PytritonSenseVoice
 #   pip install -e .
-  # pip install jiwer WeTextProcessing wandb zhon sherpa-onnx kaldialign
+  # pip install jiwer==3.1.0 WeTextProcessing wandb zhon sherpa-onnx kaldialign transformers==4.44.0
   n_gpus=1
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 reward_server.py --number-of-devices $n_gpus
 

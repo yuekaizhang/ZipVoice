@@ -28,6 +28,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from jiwer import compute_measures
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import pipeline
 
@@ -180,6 +181,16 @@ class SpeechEvalDataset(torch.utils.data.Dataset):
         return item
 
 
+def speech_collate_fn(batch):
+    """
+    Custom collate function for SpeechEvalDataset.
+    """
+    arrays = [d["array"] for d in batch]
+    references = [d["reference"] for d in batch]
+    wav_names = [d["wav_name"] for d in batch]
+    return {"array": arrays, "reference": references, "wav_name": wav_names}
+
+
 def main(test_list, wav_path, extension, model_dir, decode_path, batch_size, device):
     logging.info(f"Calculating WER for {wav_path}")
     model_path = os.path.join(model_dir, "wer/hubert-large-ls960-ft/")
@@ -199,15 +210,33 @@ def main(test_list, wav_path, extension, model_dir, decode_path, batch_size, dev
     )
 
     dataset = SpeechEvalDataset(wav_path, test_list, extension)
-
-    transcription_results = tqdm(
-        asr_pipeline(
-            dataset,
-            generate_kwargs={"language": "english", "task": "transcribe"},
-            batch_size=batch_size,
-        ),
-        total=len(dataset),
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=2,
+        shuffle=False,
+        collate_fn=speech_collate_fn,
     )
+
+    transcription_results = []
+    for batch in tqdm(dataloader):
+        # The asr_pipeline expects a list of audio arrays.
+        # We also disable the pipeline's internal batching by not passing batch_size.
+        transcriptions = asr_pipeline(
+            list(batch["array"]),
+            generate_kwargs={"language": "english", "task": "transcribe"},
+        )
+        references = batch["reference"]
+        wav_names = batch["wav_name"]
+
+        for i in range(len(transcriptions)):
+            transcription_results.append(
+                {
+                    "text": transcriptions[i]["text"],
+                    "reference": references[i],
+                    "wav_name": wav_names[i],
+                }
+            )
 
     # Initialize metrics for overall WER calculation
     wers = []
@@ -226,9 +255,9 @@ def main(test_list, wav_path, extension, model_dir, decode_path, batch_size, dev
             "Name\tWER\tTruth\tHypothesis\tInsertions\tDeletions\tSubstitutions\n"
         )
     for out in transcription_results:
-        wav_name = out["wav_name"][0]
+        wav_name = out["wav_name"]
         transcription = out["text"].strip()
-        text_ref = out["reference"][0].strip()
+        text_ref = out["reference"].strip()
         truth, hypo, wer, subs, dele, inse, word_num = process_one(
             transcription, text_ref
         )

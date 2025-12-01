@@ -208,10 +208,10 @@ def run(rank, world_size, args):
                     sde_noise_level=args.noise_level,
                     enable_ln_sigma_sampling=args.enable_ln_sigma_sampling,
                 )
-                if args.enable_sde:
-                    output_wavs_rollout, _, _, _ = pipeline_output
-                else:
-                    output_wavs_rollout = pipeline_output
+                # if args.enable_sde:
+                output_wavs_rollout, _, _, _ = pipeline_output
+                # else:
+                    # output_wavs_rollout = pipeline_output
 
                 rewards_rollout, metadata = asr_reward_computation(
                     output_wavs_rollout, target_texts_list

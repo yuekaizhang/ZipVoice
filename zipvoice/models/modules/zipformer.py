@@ -303,21 +303,22 @@ class TTSZipformer(nn.Module):
             mu = mu.permute(1, 0, 2)
             ln_sigma = ln_sigma.permute(1, 0, 2)
 
-            snd = torch.randn_like(mu)
+            # snd = torch.randn_like(mu)
 
-            if t[0] < 0.01:
-                temperature = 40
-            else:
-                temperature = 1
-            temperature = 0
-            # T_start = 10
-            # T_end = 0.1
-            # t_now = t[0]
-            # # temperature = T_end + 0.5 * (T_start - T_end) * (1 + torch.cos(math.pi * t_now))
-            # temperature = T_start * (T_end / T_start) ** t_now
+            # if t[0] < 0.01:
+            #     temperature = 40
+            # else:
+            #     temperature = 1
+            # # temperature = 0
+            # # T_start = 10
+            # # T_end = 0.1
+            # # t_now = t[0]
+            # # # temperature = T_end + 0.5 * (T_start - T_end) * (1 + torch.cos(math.pi * t_now))
+            # # temperature = T_start * (T_end / T_start) ** t_now
 
-            v = mu + snd * torch.exp(ln_sigma) * temperature
-            return mu, ln_sigma, v
+            # v = mu + snd * torch.exp(ln_sigma) * temperature
+            # return mu, ln_sigma, v
+            return mu, ln_sigma
         else:
             mu = mu.permute(1, 0, 2)
             return mu

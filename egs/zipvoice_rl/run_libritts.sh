@@ -28,7 +28,7 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
       python3 -m zipvoice.bin.train_zipvoice \
             --world-size 8 \
             --use-fp16 0 \
-            --num-epochs 60 \
+            --num-epochs 100 \
             --max-duration 250 \
             --lr-epochs 10 \
             --max-len 20 \
@@ -39,14 +39,14 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
             --dataset libritts \
             --manifest-dir data/fbank \
             --enable-ln-sigma-head True \
-            --start-epoch 2 \
+            --start-epoch 41 \
             --exp-dir exp/zipvoice_libritts_p_no_zero_init
 fi
 
 if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
       echo "Stage 3: Average the checkpoints for ZipVoice"
       python3 -m zipvoice.bin.generate_averaged_model \
-            --epoch 40 \
+            --epoch 80 \
             --avg 10 \
             --model-name zipvoice \
             --exp-dir exp/zipvoice_libritts_p_no_zero_init
@@ -140,10 +140,10 @@ if [ ${stage} -le 80 ] && [ ${stop_stage} -ge 80 ]; then
       python3 -m zipvoice.bin.infer_zipvoice \
             --model-name zipvoice \
             --model-dir exp/zipvoice_libritts_p_no_zero_init \
-            --checkpoint-name epoch-40-avg-10.pt \
+            --checkpoint-name epoch-80-avg-10.pt \
             --tokenizer libritts \
             --test-list download/librispeech_pc_testset/test.tsv \
-            --res-dir results/test_libritts \
+            --res-dir results/test_libritts_e80_avg10_t1 \
             --num-step 8 \
             --guidance-scale 1 \
             --t-shift 0.7 \

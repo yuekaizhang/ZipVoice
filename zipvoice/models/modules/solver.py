@@ -18,7 +18,7 @@
 from typing import Optional, Union
 import math
 import torch
-
+import torch.nn.functional as F
 from typing import Tuple, List
 def randn_tensor(
     shape: Union[Tuple, List],
@@ -155,12 +155,24 @@ class DiffusionModel(torch.nn.Module):
                 **kwargs,
             )
             if self.model.enable_ln_sigma_head:
-                _, _, v = model_out
-                v_uncond, v_cond = v.chunk(2, dim=0)
-                res = (
-                    1 + guidance_scale
-                ) * v_cond - guidance_scale * v_uncond
-                return res
+                # mu, ln_sigma, v = model_out
+                # v_uncond, v_cond = v.chunk(2, dim=0)
+                # res = (
+                #     1 + guidance_scale
+                # ) * v_cond - guidance_scale * v_uncond
+                mu_all, ln_sigma_all = model_out
+                mu_uncond, mu_cond = mu_all.chunk(2, dim=0)
+                ln_sigma_uncond, ln_sigma_cond = ln_sigma_all.chunk(2, dim=0)
+                mu = mu_cond + guidance_scale * (mu_cond - mu_uncond)
+                ln_sigma = ln_sigma_cond + guidance_scale * (ln_sigma_cond - ln_sigma_uncond)
+                snd = torch.randn_like(mu)
+                if t < 0.01:
+                    temperature = 40
+                else:
+                    temperature = 1
+                # temperature = 0
+                v = mu + snd * torch.exp(ln_sigma) * temperature
+                return mu, ln_sigma, v
             else:
                 data_uncond, data_cond = model_out.chunk(2, dim=0)
                 res = (1 + guidance_scale) * data_cond - guidance_scale * data_uncond
@@ -362,10 +374,13 @@ class EulerSolver:
                 guidance_scale=guidance_scale,
                 **kwargs,
             )
-            v = model_out
+            if enable_ln_sigma_sampling:
+                mu, ln_sigma, v = model_out
+            else:
+                v = model_out
 
             # last step, use the original sample
-            if enable_sde and step == 0:
+            if (enable_sde and step == 0):
                 x, log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
                     v,
                     timesteps[step + 1],
@@ -373,15 +388,33 @@ class EulerSolver:
                     x,
                     noise_level=sde_noise_level,
                 )
-                latents.append(x)
-                log_probs.append(log_prob)
                 prev_sample_means.append(prev_sample_mean)
                 std_dev_ts.append(std_dev_t)
+                latents.append(x)
+                log_probs.append(log_prob)
             else:
+                # breakpoint()
                 x = x + v * (timesteps[step + 1] - timesteps[step])
+        
+        if enable_ln_sigma_sampling:
+                prob = torch.exp(- F.mse_loss(mu, v, reduction='none') / (2 * (torch.exp(ln_sigma) ** 2)))
+                prob = prob / torch.exp(ln_sigma)
+                # Compute log_prob per sample, considering padding.
+                log_prob_tensor = torch.log(prob)
+                valid_mask = ~padding_mask.unsqueeze(-1)  # (B, T, 1)
+                log_prob_tensor = log_prob_tensor * valid_mask
+
+                num_valid_elements = (~padding_mask).sum(dim=1) * prob.shape[-1]
+                num_valid_elements = num_valid_elements.clamp(min=1.0)
+
+                log_prob = log_prob_tensor.sum(dim=(1, 2)) / num_valid_elements
+                log_probs.append(log_prob)
+                latents.append(x)
 
         if enable_sde:
             return x, log_probs, latents, timesteps, prev_sample_means, std_dev_ts
+        elif enable_ln_sigma_sampling:
+            return x, log_probs, latents, timesteps
         else:
             return x
 

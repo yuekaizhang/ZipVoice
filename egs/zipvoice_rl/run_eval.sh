@@ -76,8 +76,9 @@ fi
 
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
       echo "Stage 4: Evaluation on LibriSpeech-PC"
+      export CUDA_VISIBLE_DEVICES=1
       model_path=${download_dir}/tts_eval_models
-      wav_path=results/test_libritts
+      wav_path=results/test_libritts_e80_avg10_t0
       test_tsv=${download_dir}/librispeech_pc_testset/test.tsv
       # Use LibriSpeech style transcripts for WER evaluation
       transcript_tsv=${download_dir}/librispeech_pc_testset/transcript.tsv

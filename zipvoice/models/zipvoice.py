@@ -134,6 +134,7 @@ class ZipVoice(nn.Module):
 
         self.embed = nn.Embedding(vocab_size, text_embed_dim)
         self.solver = EulerSolver(self, func_name="forward_fm_decoder")
+        self.enable_ln_sigma_sampling = enable_ln_sigma_head
 
     def forward_fm_decoder(
         self,
@@ -187,8 +188,10 @@ class ZipVoice(nn.Module):
             decoder_out = self.fm_decoder(x=xt, t=t, padding_mask=padding_mask)
 
         if self.enable_ln_sigma_head:
-            vt, ln_sigma, v = decoder_out
-            return vt, ln_sigma, v
+            # mu, ln_sigma, v = decoder_out
+            # return mu, ln_sigma, v
+            mu, ln_sigma = decoder_out
+            return mu, ln_sigma
         else:
             vt = decoder_out
             return vt
@@ -395,7 +398,8 @@ class ZipVoice(nn.Module):
             # loss = F.mse_loss(mu, flow, reduction='none') / (2 * (torch.exp(ln_sig) ** 2) + 1e-6) + ln_sig
             # loss += (t * t) * ln_sig
             # mu -> vt, flow -> ut, ln_sig -> ln_sigma
-            vt, ln_sigma, v = fm_decoder_out
+            # vt, ln_sigma, v = fm_decoder_out
+            vt, ln_sigma = fm_decoder_out
             mse = (vt - ut) ** 2
             denominator = 2 * torch.exp(2 * ln_sigma) + 1e-6
             loss_dist = mse / denominator + ln_sigma
@@ -496,6 +500,17 @@ class ZipVoice(nn.Module):
                 sde_noise_level=sde_noise_level,
                 enable_ln_sigma_sampling=enable_ln_sigma_sampling,
             )
+        elif enable_ln_sigma_sampling:
+            x1, log_probs, latents, timesteps = self.solver.sample(
+                x=x0,
+                text_condition=text_condition,
+                speech_condition=speech_condition,
+                padding_mask=padding_mask,
+                num_step=num_step,
+                guidance_scale=guidance_scale,
+                t_shift=t_shift,
+                enable_ln_sigma_sampling=enable_ln_sigma_sampling,
+            )
         else:
             x1 = self.solver.sample(
                 x=x0,
@@ -523,7 +538,7 @@ class ZipVoice(nn.Module):
             x1_prompt[i, : prompt_features_lens[i], :] = x1[
                 i, : prompt_features_lens[i]
             ]
-        if enable_sde:
+        if enable_sde or enable_ln_sigma_sampling:
             return x1_wo_prompt, x1_wo_prompt_lens, x1_prompt, prompt_features_lens, log_probs, latents, timesteps
         else:
             return x1_wo_prompt, x1_wo_prompt_lens, x1_prompt, prompt_features_lens

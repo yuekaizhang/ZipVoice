@@ -51,7 +51,9 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm.auto import tqdm
+from transformers import pipeline as ASR_PIPELINE
 
+from zipvoice.eval.wer.hubert import process_one
 from zipvoice.rl.stat_tracking import PerPromptStatTracker
 from zipvoice.rl.pipeline_zipvoice import ZipVoicePipeline
 from zipvoice.models.modules.solver import sde_step_with_logprob
@@ -76,7 +78,15 @@ from egs.zipvoice_rl.scripts.offline_decode_files import (
     write_error_stats,
     normalize_text_alimeeting,
 )
-
+import torch.nn.functional as F
+from typing import Callable
+# from egs.zipvoice_rl.reward_server import get_reward_value
+def get_reward_value(c):
+    k_pe = 12
+    exponents = 1.5
+    pow_exp_val = np.exp(-k_pe * c ** exponents)
+    # return 1.0 - np.tanh(3.0 * c)
+    return pow_exp_val
 tqdm = partial(tqdm, dynamic_ncols=True)
 
 
@@ -218,27 +228,101 @@ def compute_log_prob(model, pipeline, sample, j, params):
         )
 
     # TODO: check zipvoice and zipvoice_distill difference
-    v = model.forward_fm_decoder(
+    outputs = model.forward_fm_decoder(
         t=current_t,
         xt=latents.clone(),
-        text_condition=sample["text_condition"].clone(),
-        speech_condition=sample["speech_condition"].clone(),
-        padding_mask=sample["padding_mask"].clone(),
+        text_condition=sample["text_condition"],
+        speech_condition=sample["speech_condition"],
+        padding_mask=sample["padding_mask"],
         guidance_scale=guidance_scale,
     )
 
-    # Compute the log prob of next_latents given latents under the current model
-    _, log_prob, _, _ = sde_step_with_logprob(
-        v,
-        sigma_prev=next_t,
-        sigma=current_t,
-        sample=latents.clone(),
-        prev_sample=sample["next_latents"][:, j].clone(),
-        noise_level=params.noise_level,
-        sde_type="cps",  # Make sure this matches the one used in sampling
-    )
+    if model.enable_ln_sigma_sampling:
+        mu, ln_sigma = outputs
+        prob = torch.exp(- F.mse_loss(mu, sample["next_latents"][:, j].clone(), reduction='none') / (2 * (torch.exp(ln_sigma) ** 2)))
+        prob = prob / torch.exp(ln_sigma)
+        log_prob_tensor = torch.log(prob)
+        padding_mask = sample["padding_mask"].clone()
+        valid_mask = ~padding_mask.unsqueeze(-1)  # (B, T, 1)
+        log_prob_tensor = log_prob_tensor * valid_mask
+
+        num_valid_elements = (~padding_mask).sum(dim=1) * prob.shape[-1]
+        num_valid_elements = num_valid_elements.clamp(min=1.0)
+
+        log_prob = log_prob_tensor.sum(dim=(1, 2)) / num_valid_elements
+    else:
+        assert params.enable_sde, "Only SDE and LNS sampling are supported for log probability computation"
+        v = outputs
+        # Compute the log prob of next_latents given latents under the current model
+        _, log_prob, _, _ = sde_step_with_logprob(
+            v,
+            sigma_prev=next_t,
+            sigma=current_t,
+            sample=latents.clone(),
+            prev_sample=sample["next_latents"][:, j].clone(),
+            noise_level=params.noise_level,
+            sde_type="cps",  # Make sure this matches the one used in sampling
+        )
 
     return log_prob
+
+
+def asr_reward_computation_en(
+    asr_pipeline, wavs: List[torch.Tensor], texts: List[str]
+) -> (dict, dict):
+    """
+    Computes ASR-based reward for English speech using a Hubert model.
+    This function computes the WER between the generated speech and the ground-truth
+    text and returns a reward based on it (1 - WER).
+
+    Args:
+        asr_pipeline: The pre-initialized ASR pipeline from Hugging Face.
+        wavs: A list of speech waveforms as torch tensors.
+        texts: A list of ground-truth transcriptions.
+
+    Returns:
+        A tuple of two dictionaries:
+        - The first dictionary contains the rewards: {"asr_reward": [rewards...]}
+        - The second dictionary contains metadata: {"transcripts": [transcripts...]}
+    """
+    if not wavs:
+        return {"asr_reward": []}, {"transcripts": []}
+
+    # Resample to 16kHz for the Hubert model and convert to numpy arrays.
+    wavs_16k = []
+    resampler = torchaudio.transforms.Resample(orig_freq=24000, new_freq=16000)
+    for w in wavs:
+        if w.ndim == 1:
+            w = w.unsqueeze(0)
+        resampled_w = resampler(w.cpu())
+        wavs_16k.append(resampled_w.squeeze().numpy())
+
+    try:
+        transcriptions_result = asr_pipeline(
+            wavs_16k,
+            generate_kwargs={"language": "english", "task": "transcribe"},
+        )
+        transcriptions = [item["text"] for item in transcriptions_result]
+    except Exception as e:
+        logging.warning(f"ASR pipeline failed with error: {e}. Returning 0.0 rewards.")
+        rewards = [0.0] * len(wavs)
+        transcripts = [""] * len(wavs)
+        return {"asr_reward": rewards}, {"transcripts": transcripts}
+
+    rewards = []
+    processed_transcripts = []
+    for i in range(len(transcriptions)):
+        hypo = transcriptions[i]
+        truth = texts[i]
+        _, processed_hypo, wer, _, _, _, _ = process_one(hypo, truth)
+
+        # Reward is 1 - WER. WER from process_one is a fraction.
+        # FIXME: WER to reward mapping 
+        rewards.append(get_reward_value(wer))
+        processed_transcripts.append(processed_hypo)
+        print("ground truth: ", truth, "processed transcript: ", processed_hypo, "WER: ", wer)
+
+    return {"asr_reward": rewards}, {"transcripts": processed_transcripts}
 
 
 def get_parser():
@@ -339,7 +423,12 @@ def get_parser():
     parser.add_argument(
         "--eval-batch-size", type=int, default=4, help="Batch size for evaluation."
     )
-
+    parser.add_argument(
+        "--model-dir", type=str, default="exp/zipvoice_distill", help="Model directory."
+    )
+    parser.add_argument(
+        "--checkpoint-name", type=str, default="epoch-40-avg-10.pt", help="Checkpoint name."
+    )
     return parser
 
 
@@ -373,6 +462,7 @@ def evaluate(
     pipeline: ZipVoicePipeline,
     epoch: int,
     global_step: int,
+    reward_fn: Callable,
 ):
     """Run evaluation and log metrics."""
     if rank == 0:
@@ -444,7 +534,7 @@ def evaluate(
                 save_path = f"{eval_dir}/{save_id}.wav"
                 torchaudio.save(save_path, wav.cpu(), sample_rate=pipeline.sampling_rate)
 
-            rewards, metadata = asr_reward_computation(output_wavs, target_texts_list)
+            rewards, metadata = reward_fn(output_wavs, target_texts_list)
             transcripts = metadata.get("transcripts", [""] * len(output_wavs))
 
             ids_list.extend(ids)
@@ -452,85 +542,85 @@ def evaluate(
             transcripts_list_rank.extend(transcripts)
             rewards_list_rank.extend(rewards["asr_reward"])
 
-    if world_size > 1:
-        dist.barrier()  # wait for all processes to finish inference
+    # if world_size > 1:
+    #     dist.barrier()  # wait for all processes to finish inference
 
-        # gather all results
-        gathered_ids = [None] * world_size
-        dist.all_gather_object(gathered_ids, ids_list)
+    #     # gather all results
+    #     gathered_ids = [None] * world_size
+    #     dist.all_gather_object(gathered_ids, ids_list)
 
-        gathered_targets = [None] * world_size
-        dist.all_gather_object(gathered_targets, target_texts_list_rank)
+    #     gathered_targets = [None] * world_size
+    #     dist.all_gather_object(gathered_targets, target_texts_list_rank)
 
-        gathered_transcripts = [None] * world_size
-        dist.all_gather_object(gathered_transcripts, transcripts_list_rank)
+    #     gathered_transcripts = [None] * world_size
+    #     dist.all_gather_object(gathered_transcripts, transcripts_list_rank)
 
-        gathered_rewards = [None] * world_size
-        dist.all_gather_object(gathered_rewards, rewards_list_rank)
+    #     gathered_rewards = [None] * world_size
+    #     dist.all_gather_object(gathered_rewards, rewards_list_rank)
 
-        if rank == 0:
-            # Flatten lists
-            all_ids = [item for sublist in gathered_ids for item in sublist]
-            all_targets = [item for sublist in gathered_targets for item in sublist]
-            all_transcripts = [
-                item for sublist in gathered_transcripts for item in sublist
-            ]
-            all_rewards = [item for sublist in gathered_rewards for item in sublist]
-    else:
-        all_ids = ids_list
-        all_targets = target_texts_list_rank
-        all_transcripts = transcripts_list_rank
-        all_rewards = rewards_list_rank
+    #     if rank == 0:
+    #         # Flatten lists
+    #         all_ids = [item for sublist in gathered_ids for item in sublist]
+    #         all_targets = [item for sublist in gathered_targets for item in sublist]
+    #         all_transcripts = [
+    #             item for sublist in gathered_transcripts for item in sublist
+    #         ]
+    #         all_rewards = [item for sublist in gathered_rewards for item in sublist]
+    # else:
+    #     all_ids = ids_list
+    #     all_targets = target_texts_list_rank
+    #     all_transcripts = transcripts_list_rank
+    #     all_rewards = rewards_list_rank
 
-    if rank == 0:
-        # Calculate WER
-        final_results = []
-        for i in range(len(all_ids)):
-            normalized_target = normalize_text_alimeeting(all_targets[i])
-            final_results.append((all_ids[i], normalized_target, all_transcripts[i]))
+    # if rank == 0:
+    #     # Calculate WER
+    #     final_results = []
+    #     for i in range(len(all_ids)):
+    #         normalized_target = normalize_text_alimeeting(all_targets[i])
+    #         final_results.append((all_ids[i], normalized_target, all_transcripts[i]))
 
-        store_transcripts(
-            filename=f"{eval_dir}/recogs-sensevoice.txt", texts=final_results
-        )
-        errs_file = f"{eval_dir}/errs-sensevoice.txt"
-        wer_line = ""
-        with open(errs_file, "w", encoding="utf-8") as f:
-            write_error_stats(f, "eval-set", final_results, enable_log=False)
-        with open(errs_file, "r") as f:
-            wer_line = f.readline().strip()
-            logging.info(wer_line)
-            logging.info(f.readline().strip())  # Detailed errors
+    #     store_transcripts(
+    #         filename=f"{eval_dir}/recogs-sensevoice.txt", texts=final_results
+    #     )
+    #     errs_file = f"{eval_dir}/errs-sensevoice.txt"
+    #     wer_line = ""
+    #     with open(errs_file, "w", encoding="utf-8") as f:
+    #         write_error_stats(f, "eval-set", final_results, enable_log=False)
+    #     with open(errs_file, "r") as f:
+    #         wer_line = f.readline().strip()
+    #         logging.info(wer_line)
+    #         logging.info(f.readline().strip())  # Detailed errors
 
-        wer = float(wer_line.split(" ")[2])
+    #     wer = float(wer_line.split(" ")[2])
 
-        # Reward Statistics
-        rewards_arr = np.array(all_rewards)
-        mean_reward = np.mean(rewards_arr)
-        std_reward = np.std(rewards_arr)
-        variance_reward = np.var(rewards_arr)
+    #     # Reward Statistics
+    #     rewards_arr = np.array(all_rewards)
+    #     mean_reward = np.mean(rewards_arr)
+    #     std_reward = np.std(rewards_arr)
+    #     variance_reward = np.var(rewards_arr)
 
-        stats_output = [
-            "--- Reward Statistics ---",
-            f"Mean reward: {mean_reward:.4f}",
-            f"Standard deviation of reward: {std_reward:.4f}",
-            f"Variance of reward: {variance_reward:.4f}",
-        ]
+    #     stats_output = [
+    #         "--- Reward Statistics ---",
+    #         f"Mean reward: {mean_reward:.4f}",
+    #         f"Standard deviation of reward: {std_reward:.4f}",
+    #         f"Variance of reward: {variance_reward:.4f}",
+    #     ]
 
-        logging.info("\n".join(stats_output))
+    #     logging.info("\n".join(stats_output))
 
-        # Save to file
-        with open(f"{eval_dir}/rewards.txt", "w") as f:
-            f.write("\n".join(stats_output))
+    #     # Save to file
+    #     with open(f"{eval_dir}/rewards.txt", "w") as f:
+    #         f.write("\n".join(stats_output))
 
-        # Log to wandb
-        wandb.log(
-            {
-                "eval/wer": wer,
-                "eval/mean_reward": mean_reward,
-                "eval/variance_reward": variance_reward,
-            },
-            step=global_step,
-        )
+    #     # Log to wandb
+    #     wandb.log(
+    #         {
+    #             "eval/wer": wer,
+    #             "eval/mean_reward": mean_reward,
+    #             "eval/variance_reward": variance_reward,
+    #         },
+    #         step=global_step,
+    #     )
 
     if world_size > 1:
         dist.barrier()
@@ -547,7 +637,9 @@ def train(params: AttributeDict, rank: int, world_size: int):
     logging.info(f"\n{params}")
 
     # Load TTS model via pipeline
-    pipeline = ZipVoicePipeline(model_name=params.pretrained_model, device=device)
+    tokenizer_type = "libritts" if "libritts" in params.model_dir else "emilia"
+    pipeline = ZipVoicePipeline(model_name=params.pretrained_model, model_dir=params.model_dir, checkpoint_name=params.checkpoint_name, tokenizer_type=tokenizer_type, device=device)
+    # pipeline = ZipVoicePipeline(model_name=params.pretrained_model, device=device)
     model = pipeline.model
 
     if params.per_prompt_stat_tracking:
@@ -589,7 +681,27 @@ def train(params: AttributeDict, rank: int, world_size: int):
 
     scaler = create_grad_scaler(enabled=params.use_fp16)
 
-    reward_fn = asr_reward_computation
+    if "libritts" in params.model_dir:
+        # It is recommended to download the model from https://huggingface.co/k2-fsa/TTS_eval_models
+        # and place it in a directory, e.g., 'tts_eval_models_hubert'.
+        # Then create a symlink: ln -s /path/to/your/model/dir tts_eval_models
+        asr_model_path = "download/tts_eval_models/wer/hubert-large-ls960-ft/"
+        if not os.path.exists(asr_model_path):
+            logging.error(f"ASR model not found at {asr_model_path}")
+            logging.error(
+                "Please download evaluation models from "
+                "https://huggingface.co/k2-fsa/TTS_eval_models"
+            )
+            exit(1)
+        asr_pipeline = ASR_PIPELINE(
+            "automatic-speech-recognition",
+            model=asr_model_path,
+            device=device,
+            tokenizer=asr_model_path,
+        )
+        reward_fn = partial(asr_reward_computation_en, asr_pipeline)
+    else:
+        reward_fn = asr_reward_computation
 
     executor = futures.ThreadPoolExecutor(max_workers=2)
     autocast = partial(torch_autocast, dtype=torch.float16, enabled=params.use_fp16)
@@ -631,11 +743,13 @@ def train(params: AttributeDict, rank: int, world_size: int):
                         text=target_texts_list,
                         num_step=params.num_steps,
                         guidance_scale=params.guidance_scale,
-                        enable_sde=True,
+                        enable_sde=False if model.enable_ln_sigma_sampling else True,
                         sde_noise_level=params.noise_level,
+                        enable_ln_sigma_sampling=model.enable_ln_sigma_sampling,
                     )
 
             latents = torch.stack(latents, dim=1)
+            # TODO: becareful about the shape of log_probs
             log_probs = torch.stack(log_probs, dim=1)
             timesteps = timesteps.unsqueeze(0).repeat(latents.size(0), 1)
 
@@ -650,7 +764,11 @@ def train(params: AttributeDict, rank: int, world_size: int):
                 unwrapped_model.forward_text_inference_ratio_duration(
                     tokens=prepared_inputs["tokens"],
                     prompt_tokens=prepared_inputs["prompt_tokens"],
-                    prompt_features_lens=prepared_inputs["prompt_features_lens"],
+                    prompt_features_lens=prepared_inputs[
+                        "prompt_features_lens"
+                    ]
+                    .clone()
+                    .detach(),
                     speed=1.0,
                 )
             )
@@ -664,14 +782,18 @@ def train(params: AttributeDict, rank: int, world_size: int):
 
             samples.append(
                 {
-                    "prompts": prompts, # list[str]
-                    "latents": latents[:, :-1], # torch.Tensor(batch_size, num_timesteps, num_frames, feat_dim)
-                    "next_latents": latents[:, 1:], # torch.Tensor(batch_size, num_timesteps, num_frames, feat_dim)
-                    "log_probs": log_probs, # torch.Tensor(batch_size, num_timesteps - 1)
-                    "timesteps": timesteps, # torch.Tensor(batch_size, num_timesteps)
-                    "text_condition": text_condition.detach(),
-                    "speech_condition": speech_condition.detach(),
-                    "padding_mask": padding_mask.detach(),
+                    "prompts": prompts,  # list[str]
+                    "latents": latents[
+                        :, :-1
+                    ].clone(),  # torch.Tensor(batch_size, num_timesteps, num_frames, feat_dim)
+                    "next_latents": latents[
+                        :, 1:
+                    ].clone(),  # torch.Tensor(batch_size, num_timesteps, num_frames, feat_dim)
+                    "log_probs": log_probs.clone(),  # torch.Tensor(batch_size, num_timesteps - 1)
+                    "timesteps": timesteps.clone(),  # torch.Tensor(batch_size, num_timesteps)
+                    "text_condition": text_condition.clone(),
+                    "speech_condition": speech_condition.clone(),
+                    "padding_mask": padding_mask.clone(),
                     "rewards": rewards_future,
                 }
             )
@@ -752,13 +874,13 @@ def train(params: AttributeDict, rank: int, world_size: int):
                 total=len(samples)
             ):
                 if global_step % params.eval_freq == 0:
-                    evaluate(params, rank, world_size, pipeline, epoch, global_step)
+                    evaluate(params, rank, world_size, pipeline, epoch, global_step, reward_fn)
                     # Restore model to training mode after evaluation
                     if isinstance(model, DDP):
                         model.module.train()
                     else:
                         model.train()
-                timestep_losses = []
+                # timestep_losses = []
                 for j in range(num_train_timesteps):
                     with autocast():
                         unwrapped_model = model.module if isinstance(model, DDP) else model
@@ -780,14 +902,15 @@ def train(params: AttributeDict, rank: int, world_size: int):
                             1.0 + params.clip_range,
                         )
                         loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-                        timestep_losses.append(loss)
+                        scaler.scale(loss).backward()
+                        # timestep_losses.append(loss)
 
                 # Sum the losses from all timesteps and average
-                total_loss = sum(timestep_losses) / num_train_timesteps
+                # total_loss = sum(timestep_losses) / num_train_timesteps
                 
                 # Accumulate loss for gradient accumulation
-                loss_to_backward = total_loss / params.gradient_accumulation_steps
-                scaler.scale(loss_to_backward).backward()
+                # loss_to_backward = total_loss / params.gradient_accumulation_steps
+                # scaler.scale(loss_to_backward).backward()
 
                 if (i + 1) % params.gradient_accumulation_steps == 0 or (i + 1) == len(samples):
                     scaler.unscale_(optimizer)

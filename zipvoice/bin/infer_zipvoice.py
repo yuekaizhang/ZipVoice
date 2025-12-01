@@ -389,6 +389,9 @@ def generate_sentence_raw_evaluation(
         pred_features_lens,
         pred_prompt_features,
         pred_prompt_features_lens,
+        _,
+        _,
+        _
     ) = model.sample(
         tokens=tokens,
         prompt_tokens=prompt_tokens,
@@ -399,6 +402,7 @@ def generate_sentence_raw_evaluation(
         duration="predict",
         num_step=num_step,
         guidance_scale=guidance_scale,
+        enable_ln_sigma_sampling=True,
     )
 
     # Postprocess predicted features

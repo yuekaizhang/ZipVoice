@@ -300,3 +300,33 @@ if [ $stage -le 11 ] && [ $stop_stage -ge 11 ]; then
   done
   done
 fi
+
+
+if [ ${stage} -le 101 ] && [ ${stop_stage} -ge 101 ]; then
+      echo "Stage 8: RL Fine-tune the ZipVoice model using hifi-tts data"
+
+      # [ -z "$max_len" ] && { echo "Error: max_len is not set!" >&2; exit 1; }
+
+      num_steps=32
+      exp_name=zipvoice_grpo_${num_steps}
+      python3 -m zipvoice.bin.train_zipvoice_grpo \
+      --world-size 1 \
+      --num-steps ${num_steps} \
+      --model-dir exp/zipvoice_libritts_p_no_zero_init \
+      --checkpoint-name epoch-40.pt \
+      --train-batch-size 8 \
+      --eval-batch-size 32 \
+      --num-audio-per-prompt 8 \
+      --num-batches-per-epoch 2 \
+      --global-std 1 \
+      --learning-rate 1e-5 \
+      --save-freq 100 \
+      --eval-freq 100 \
+      --huggingface-dataset-split zero_shot_en \
+      --use-fp16 0 \
+      --run-name ${exp_name} \
+      --exp-dir exp/${exp_name} \
+      --pretrained-model zipvoice \
+      --dataset-path hifi_tts-cosy.jsonl
+
+fi

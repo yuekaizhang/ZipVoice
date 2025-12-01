@@ -146,7 +146,7 @@ class ZipVoicePipeline(object):
         }
         self.defaults = model_defaults.get(self.model_name, {})
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def __call__(
         self,
         prompt_text: Union[str, List[str]],
@@ -195,23 +195,23 @@ class ZipVoicePipeline(object):
             enable_ln_sigma_sampling=enable_ln_sigma_sampling,
         )
 
-        if enable_sde:
-            (
-                pred_features,
-                pred_features_lens,
-                _,
-                _,
-                log_probs,
-                latents,
-                timesteps,
-            ) = model_output
-        else:
-            (
-                pred_features,
-                pred_features_lens,
-                _,
-                _,
-            ) = model_output
+        # if enable_sde:
+        (
+            pred_features,
+            pred_features_lens,
+            _,
+            _,
+            log_probs,
+            latents,
+            timesteps,
+        ) = model_output
+        # else:
+        #     (
+        #         pred_features,
+        #         pred_features_lens,
+        #         _,
+        #         _,
+        #     ) = model_output
 
 
         pred_features = pred_features.permute(0, 2, 1) / feat_scale  # (B, C, T)
@@ -227,13 +227,13 @@ class ZipVoicePipeline(object):
             if prompt_rms_list[i] < target_rms:
                 wav = wav * prompt_rms_list[i] / target_rms
             batch_wavs.append(wav.cpu())
-        
-        if enable_sde:
-            return batch_wavs, latents, log_probs, timesteps
-        else: # sde disabled
-            return batch_wavs
+        return batch_wavs, latents, log_probs, timesteps
+        # if enable_sde:
+        #     return batch_wavs, latents, log_probs, timesteps
+        # else: # sde disabled
+        #     return batch_wavs
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def prepare_latents(
         self,
         prompt_text: Union[str, List[str]],

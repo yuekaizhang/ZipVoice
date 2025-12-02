@@ -426,6 +426,7 @@ class ZipVoice(nn.Module):
         enable_sde: bool = False,
         sde_noise_level: float = 0.1,
         enable_ln_sigma_sampling: bool = False,
+        temperature: float = 1.0,
     ) -> torch.Tensor:
         """
         Generate acoustic features, given text tokens, prompts feature
@@ -510,6 +511,7 @@ class ZipVoice(nn.Module):
                 guidance_scale=guidance_scale,
                 t_shift=t_shift,
                 enable_ln_sigma_sampling=enable_ln_sigma_sampling,
+                temperature=temperature,
             )
         else:
             x1 = self.solver.sample(

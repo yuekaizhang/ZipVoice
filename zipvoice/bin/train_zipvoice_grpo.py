@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import random
+import copy
 from concurrent import futures
 from functools import partial
 from pathlib import Path
@@ -152,8 +153,14 @@ class SpeechPromptDataset(Dataset):
             raise FileNotFoundError(f"Neither {target_text_path} found.")
 
         # Load prompt dataset
+        # self.prompt_dataset = load_dataset(
+        #     "yuekai/aishell", "test", trust_remote_code=True
+        # )["test"]
+        # self.prompt_dataset = load_dataset(
+        #     "hf-internal-testing/librispeech_asr_dummy", "clean", trust_remote_code=True
+        # )["validation"]
         self.prompt_dataset = load_dataset(
-            "yuekai/aishell", "test", trust_remote_code=True
+            "CristianaLazar/librispeech_test", trust_remote_code=True
         )["test"]
 
     def __len__(self):
@@ -226,22 +233,26 @@ def compute_log_prob(model, pipeline, sample, j, params):
         guidance_scale = torch.tensor(
             guidance_scale, dtype=current_t.dtype, device=next_t.device
         )
+    if params.pretrained_model == "zipvoice":
+        guidance_scale = None
 
     # TODO: check zipvoice and zipvoice_distill difference
     outputs = model.forward_fm_decoder(
         t=current_t,
         xt=latents.clone(),
-        text_condition=sample["text_condition"],
-        speech_condition=sample["speech_condition"],
-        padding_mask=sample["padding_mask"],
+        text_condition=sample["text_condition"].clone(),
+        speech_condition=sample["speech_condition"].clone(),
+        padding_mask=sample["padding_mask"].clone(),
         guidance_scale=guidance_scale,
     )
 
     if model.enable_ln_sigma_sampling:
+        duration = next_t - current_t
+        v = (sample["next_latents"][:, j].clone() - sample["latents"][:, j].clone()) / duration
         mu, ln_sigma = outputs
-        prob = torch.exp(- F.mse_loss(mu, sample["next_latents"][:, j].clone(), reduction='none') / (2 * (torch.exp(ln_sigma) ** 2)))
-        prob = prob / torch.exp(ln_sigma)
-        log_prob_tensor = torch.log(prob)
+        prob = torch.exp(- F.mse_loss(mu, v, reduction='none') / (2 * (torch.exp(ln_sigma) ** 2)))
+        prob = prob / torch.exp(ln_sigma) # /  ((2* torch.pi) ** 0.5)
+        log_prob_tensor = torch.log(prob + 1e-6)
         padding_mask = sample["padding_mask"].clone()
         valid_mask = ~padding_mask.unsqueeze(-1)  # (B, T, 1)
         log_prob_tensor = log_prob_tensor * valid_mask
@@ -250,6 +261,8 @@ def compute_log_prob(model, pipeline, sample, j, params):
         num_valid_elements = num_valid_elements.clamp(min=1.0)
 
         log_prob = log_prob_tensor.sum(dim=(1, 2)) / num_valid_elements
+        # breakpoint()
+        return log_prob, mu, ln_sigma
     else:
         assert params.enable_sde, "Only SDE and LNS sampling are supported for log probability computation"
         v = outputs
@@ -264,7 +277,7 @@ def compute_log_prob(model, pipeline, sample, j, params):
             sde_type="cps",  # Make sure this matches the one used in sampling
         )
 
-    return log_prob
+        return log_prob, None, None
 
 
 def asr_reward_computation_en(
@@ -313,7 +326,7 @@ def asr_reward_computation_en(
     processed_transcripts = []
     for i in range(len(transcriptions)):
         hypo = transcriptions[i]
-        truth = texts[i]
+        truth = texts[i].lower()
         _, processed_hypo, wer, _, _, _, _ = process_one(hypo, truth)
 
         # Reward is 1 - WER. WER from process_one is a fraction.
@@ -379,6 +392,9 @@ def get_parser():
     parser.add_argument("--num-inner-epochs", type=int, default=1)
     parser.add_argument("--adv-clip-max", type=float, default=5)
     parser.add_argument("--clip-range", type=float, default=1e-4)
+    parser.add_argument(
+        "--kl-coeff", type=float, default=1.0, help="Coefficient for KL loss."
+    )
     parser.add_argument(
         "--per-prompt-stat-tracking",
         type=str2bool,
@@ -482,6 +498,7 @@ def evaluate(
         split=params.huggingface_dataset_split,
         trust_remote_code=True,
     )
+    eval_dataset = eval_dataset.select(range(64))
     if world_size > 1:
         eval_sampler = torch.utils.data.distributed.DistributedSampler(
             eval_dataset, shuffle=False
@@ -525,7 +542,9 @@ def evaluate(
                     text=target_texts_list,
                     num_step=params.num_steps,
                     guidance_scale=params.guidance_scale,
-                    enable_sde=True,
+                    enable_sde=False if pipeline.model.enable_ln_sigma_sampling else True,
+                    enable_ln_sigma_sampling=pipeline.model.enable_ln_sigma_sampling,
+                    temperature=0.0,
                     sde_noise_level=0.0,
                 )
 
@@ -542,37 +561,37 @@ def evaluate(
             transcripts_list_rank.extend(transcripts)
             rewards_list_rank.extend(rewards["asr_reward"])
 
-    # if world_size > 1:
-    #     dist.barrier()  # wait for all processes to finish inference
+    if world_size > 1:
+        dist.barrier()  # wait for all processes to finish inference
 
-    #     # gather all results
-    #     gathered_ids = [None] * world_size
-    #     dist.all_gather_object(gathered_ids, ids_list)
+        # gather all results
+        gathered_ids = [None] * world_size
+        dist.all_gather_object(gathered_ids, ids_list)
 
-    #     gathered_targets = [None] * world_size
-    #     dist.all_gather_object(gathered_targets, target_texts_list_rank)
+        gathered_targets = [None] * world_size
+        dist.all_gather_object(gathered_targets, target_texts_list_rank)
 
-    #     gathered_transcripts = [None] * world_size
-    #     dist.all_gather_object(gathered_transcripts, transcripts_list_rank)
+        gathered_transcripts = [None] * world_size
+        dist.all_gather_object(gathered_transcripts, transcripts_list_rank)
 
-    #     gathered_rewards = [None] * world_size
-    #     dist.all_gather_object(gathered_rewards, rewards_list_rank)
+        gathered_rewards = [None] * world_size
+        dist.all_gather_object(gathered_rewards, rewards_list_rank)
 
-    #     if rank == 0:
-    #         # Flatten lists
-    #         all_ids = [item for sublist in gathered_ids for item in sublist]
-    #         all_targets = [item for sublist in gathered_targets for item in sublist]
-    #         all_transcripts = [
-    #             item for sublist in gathered_transcripts for item in sublist
-    #         ]
-    #         all_rewards = [item for sublist in gathered_rewards for item in sublist]
-    # else:
-    #     all_ids = ids_list
-    #     all_targets = target_texts_list_rank
-    #     all_transcripts = transcripts_list_rank
-    #     all_rewards = rewards_list_rank
+        if rank == 0:
+            # Flatten lists
+            all_ids = [item for sublist in gathered_ids for item in sublist]
+            all_targets = [item for sublist in gathered_targets for item in sublist]
+            all_transcripts = [
+                item for sublist in gathered_transcripts for item in sublist
+            ]
+            all_rewards = [item for sublist in gathered_rewards for item in sublist]
+    else:
+        all_ids = ids_list
+        all_targets = target_texts_list_rank
+        all_transcripts = transcripts_list_rank
+        all_rewards = rewards_list_rank
 
-    # if rank == 0:
+    if rank == 0:
     #     # Calculate WER
     #     final_results = []
     #     for i in range(len(all_ids)):
@@ -592,19 +611,95 @@ def evaluate(
     #         logging.info(f.readline().strip())  # Detailed errors
 
     #     wer = float(wer_line.split(" ")[2])
+        # Calculate WER
+        total_word_num = 0
+        total_substitutions = 0
+        total_deletions = 0
+        total_insertions = 0
 
-    #     # Reward Statistics
-    #     rewards_arr = np.array(all_rewards)
-    #     mean_reward = np.mean(rewards_arr)
-    #     std_reward = np.std(rewards_arr)
-    #     variance_reward = np.var(rewards_arr)
+        wer_results_path = f"{eval_dir}/wer_results.txt"
+        with open(wer_results_path, "w", encoding="utf-8") as f_wer:
+            f_wer.write(
+                "ID\tWER\tTruth\tHypothesis\tInsertions\tDeletions\tSubstitutions\n"
+            )
 
-    #     stats_output = [
-    #         "--- Reward Statistics ---",
-    #         f"Mean reward: {mean_reward:.4f}",
-    #         f"Standard deviation of reward: {std_reward:.4f}",
-    #         f"Variance of reward: {variance_reward:.4f}",
-    #     ]
+            for i in range(len(all_ids)):
+                hypo = all_transcripts[i]
+                truth = all_targets[i]
+
+                (
+                    processed_truth,
+                    processed_hypo,
+                    wer_inst,
+                    substitutions,
+                    deletions,
+                    insertions,
+                    word_num,
+                ) = process_one(hypo, truth)
+
+                total_word_num += word_num
+                total_substitutions += substitutions
+                total_deletions += deletions
+                total_insertions += insertions
+
+                f_wer.write(
+                    f"{all_ids[i]}\t{wer_inst}\t{processed_truth}\t{processed_hypo}\t{insertions}\t{deletions}\t{substitutions}\n"
+                )
+
+            if total_word_num > 0:
+                wer = (
+                    (total_substitutions + total_deletions + total_insertions)
+                    / total_word_num
+                    * 100
+                )
+            else:
+                wer = 0.0
+
+            wer = round(wer, 2)
+
+            summary_line = f"WER = {wer}%"
+            details_line = (
+                f"Errors: {total_insertions} insertions, {total_deletions} deletions, "
+                f"{total_substitutions} substitutions, over {total_word_num} reference words"
+            )
+
+            f_wer.write(f"\n{summary_line}\n")
+            f_wer.write(f"{details_line}\n")
+
+        logging.info(summary_line)
+        logging.info(details_line)
+        #     # Calculate WER
+        #     final_results = []
+        #     for i in range(len(all_ids)):
+        #         normalized_target = normalize_text_alimeeting(all_targets[i])
+        #         final_results.append((all_ids[i], normalized_target, all_transcripts[i]))
+        #
+        #     store_transcripts(
+        #         filename=f"{eval_dir}/recogs-sensevoice.txt", texts=final_results
+        #     )
+        #     errs_file = f"{eval_dir}/errs-sensevoice.txt"
+        #     wer_line = ""
+        #     with open(errs_file, "w", encoding="utf-8") as f:
+        #         write_error_stats(f, "eval-set", final_results, enable_log=False)
+        #     with open(errs_file, "r") as f:
+        #         wer_line = f.readline().strip()
+        #         logging.info(wer_line)
+        #         logging.info(f.readline().strip())  # Detailed errors
+        #
+        #     wer = float(wer_line.split(" ")[2])
+
+        # Reward Statistics
+        rewards_arr = np.array(all_rewards)
+        mean_reward = np.mean(rewards_arr)
+        std_reward = np.std(rewards_arr)
+        variance_reward = np.var(rewards_arr)
+
+        stats_output = [
+            "--- Reward Statistics ---",
+            f"Mean reward: {mean_reward:.4f}",
+            f"Standard deviation of reward: {std_reward:.4f}",
+            f"Variance of reward: {variance_reward:.4f}",
+        ]
 
     #     logging.info("\n".join(stats_output))
 
@@ -613,14 +708,14 @@ def evaluate(
     #         f.write("\n".join(stats_output))
 
     #     # Log to wandb
-    #     wandb.log(
-    #         {
-    #             "eval/wer": wer,
-    #             "eval/mean_reward": mean_reward,
-    #             "eval/variance_reward": variance_reward,
-    #         },
-    #         step=global_step,
-    #     )
+        wandb.log(
+            {
+                "eval/wer": wer,
+                "eval/mean_reward": mean_reward,
+                "eval/variance_reward": variance_reward,
+            },
+            step=global_step,
+        )
 
     if world_size > 1:
         dist.barrier()
@@ -651,6 +746,10 @@ def train(params: AttributeDict, rank: int, world_size: int):
     # DDP
     if world_size > 1:
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+
+    unwrapped_model_for_ref = model.module if isinstance(model, DDP) else model
+    ref_model = copy.deepcopy(unwrapped_model_for_ref)
+    ref_model.eval()
 
     # Initialize the optimizer
     optimizer = torch.optim.AdamW(
@@ -711,8 +810,9 @@ def train(params: AttributeDict, rank: int, world_size: int):
     epoch = 0
     global_step = 0
     train_iter = iter(train_dataloader)
-    num_train_timesteps = params.num_steps - 1
-    num_train_timesteps = 1
+    # num_train_timesteps = params.num_steps - 1
+    num_train_timesteps = params.num_steps
+    # num_train_timesteps = 1
     while True:
         #################### SAMPLING ####################
         if isinstance(model, DDP):
@@ -743,9 +843,9 @@ def train(params: AttributeDict, rank: int, world_size: int):
                         text=target_texts_list,
                         num_step=params.num_steps,
                         guidance_scale=params.guidance_scale,
-                        enable_sde=False if model.enable_ln_sigma_sampling else True,
+                        enable_sde=False if pipeline.model.enable_ln_sigma_sampling else True,
                         sde_noise_level=params.noise_level,
-                        enable_ln_sigma_sampling=model.enable_ln_sigma_sampling,
+                        enable_ln_sigma_sampling=pipeline.model.enable_ln_sigma_sampling,
                     )
 
             latents = torch.stack(latents, dim=1)
@@ -789,11 +889,11 @@ def train(params: AttributeDict, rank: int, world_size: int):
                     "next_latents": latents[
                         :, 1:
                     ].clone(),  # torch.Tensor(batch_size, num_timesteps, num_frames, feat_dim)
-                    "log_probs": log_probs.clone(),  # torch.Tensor(batch_size, num_timesteps - 1)
-                    "timesteps": timesteps.clone(),  # torch.Tensor(batch_size, num_timesteps)
-                    "text_condition": text_condition.clone(),
-                    "speech_condition": speech_condition.clone(),
-                    "padding_mask": padding_mask.clone(),
+                    "log_probs": log_probs.clone().detach(),  # torch.Tensor(batch_size, num_timesteps - 1)
+                    "timesteps": timesteps.clone().detach(),  # torch.Tensor(batch_size, num_timesteps)
+                    "text_condition": text_condition.clone().detach(),
+                    "speech_condition": speech_condition.clone().detach(),
+                    "padding_mask": padding_mask.clone().detach(),
                     "rewards": rewards_future,
                 }
             )
@@ -854,9 +954,13 @@ def train(params: AttributeDict, rank: int, world_size: int):
                 .repeat(1, num_train_timesteps)
             )
             current_pos += batch_size
-            del s["rewards"]
+            # del s["rewards"]
             del s["prompts"]
 
+        # remove sample if all advantages are equal
+        print(f"Before removing samples: {len(samples)}")
+        samples = [s for s in samples if not all(s["advantages"].unique() == s["advantages"].mean())]
+        print(f"After removing samples: {len(samples)}")
         #################### TRAINING ####################
         for inner_epoch in range(params.num_inner_epochs):
             if isinstance(model, DDP):
@@ -880,11 +984,12 @@ def train(params: AttributeDict, rank: int, world_size: int):
                         model.module.train()
                     else:
                         model.train()
-                # timestep_losses = []
+                timestep_policy_losses = []
+                timestep_kl_losses = []
                 for j in range(num_train_timesteps):
                     with autocast():
                         unwrapped_model = model.module if isinstance(model, DDP) else model
-                        log_prob = compute_log_prob(
+                        log_prob, gen_mu, gen_ln_sigma = compute_log_prob(
                             unwrapped_model, pipeline, sample_batch, j, params
                         )
 
@@ -901,18 +1006,69 @@ def train(params: AttributeDict, rank: int, world_size: int):
                             1.0 - params.clip_range,
                             1.0 + params.clip_range,
                         )
-                        loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-                        scaler.scale(loss).backward()
-                        # timestep_losses.append(loss)
+                        policy_loss = torch.mean(
+                            torch.maximum(unclipped_loss, clipped_loss)
+                        )
+
+                        kl_loss = 0.0
+                        if gen_mu is not None:
+                            with torch.no_grad():
+                                # ref_model is already unwrapped
+                                _, ref_mu, ref_ln_sigma = compute_log_prob(
+                                    ref_model, pipeline, sample_batch, j, params
+                                )
+                                # breakpoint()
+
+                            kl_tensor = (
+                                ref_ln_sigma
+                                - gen_ln_sigma
+                                + (
+                                    torch.exp(gen_ln_sigma).pow(2)
+                                    + F.mse_loss(
+                                        gen_mu, ref_mu, reduction="none"
+                                    )
+                                )
+                                / (2 * torch.exp(ref_ln_sigma).pow(2))
+                            )
+
+                            padding_mask = sample_batch["padding_mask"].clone()
+                            valid_mask = ~padding_mask.unsqueeze(-1)
+                            kl_tensor = kl_tensor * valid_mask
+
+                            num_valid_elements = (
+                                (~padding_mask).sum(dim=1) * kl_tensor.shape[-1]
+                            )
+                            num_valid_elements = num_valid_elements.clamp(
+                                min=1.0
+                            )
+
+                            kl_loss = (
+                                kl_tensor.sum(dim=(1, 2)) / num_valid_elements
+                            ).mean()
+                            timestep_kl_losses.append(kl_loss.item())
+
+                        total_timestep_loss = (
+                            policy_loss + kl_loss * params.kl_coeff
+                        )
+                        scaler.scale(total_timestep_loss).backward()
+                        timestep_policy_losses.append(policy_loss.item())
 
                 # Sum the losses from all timesteps and average
-                # total_loss = sum(timestep_losses) / num_train_timesteps
-                
+                avg_policy_loss = sum(timestep_policy_losses) / num_train_timesteps
+                if timestep_kl_losses:
+                    avg_kl_loss = sum(timestep_kl_losses) / len(
+                        timestep_kl_losses
+                    )
+
                 # Accumulate loss for gradient accumulation
-                # loss_to_backward = total_loss / params.gradient_accumulation_steps
+                loss_to_backward = (
+                    avg_policy_loss / params.gradient_accumulation_steps
+                )
                 # scaler.scale(loss_to_backward).backward()
 
-                if (i + 1) % params.gradient_accumulation_steps == 0 or (i + 1) == len(samples):
+                if (i + 1) % params.gradient_accumulation_steps == 0 or (
+                    i + 1
+                ) == len(samples):
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         model.parameters(), params.max_grad_norm
@@ -923,14 +1079,28 @@ def train(params: AttributeDict, rank: int, world_size: int):
 
                     # Logging
                     if rank == 0:
+                        log_data = {
+                            "policy_loss": loss_to_backward
+                            * params.gradient_accumulation_steps,  # Log unnormalized batch loss
+                            "epoch": epoch,
+                            "inner_epoch": inner_epoch,
+                            "avg rewards": sample_batch["rewards"]["asr_reward"]
+                            .mean()
+                            .item(),
+                        }
+                        if timestep_kl_losses:
+                            log_data["kl_loss"] = avg_kl_loss
+                            for k, v in enumerate(timestep_kl_losses):
+                                log_data[f"kl_loss/step_{k}"] = v
+                        
+                        for k, v in enumerate(timestep_policy_losses):
+                            log_data[f"policy_loss/step_{k}"] = v
+
                         wandb.log(
-                            {
-                                "loss": loss_to_backward.item() * params.gradient_accumulation_steps, # Log unnormalized batch loss
-                                "epoch": epoch,
-                                "inner_epoch": inner_epoch,
-                            },
+                            log_data,
                             step=global_step,
                         )
+                        logging.info(log_data)
                     global_step += 1
         
         # Checkpointing

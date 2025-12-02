@@ -137,14 +137,25 @@ fi
 
 if [ ${stage} -le 80 ] && [ ${stop_stage} -ge 80 ]; then
       echo "Stage 80: Inference of the ZipVoice model"
+      model_dir=exp/zipvoice_libritts_p_no_zero_init
+      checkpoint_name=epoch-80-avg-10.pt
+
+      model_dir=exp/zipvoice_grpo_8_rerun
+      checkpoint_name=epoch-100.pt
+
+      model_dir=exp/zipvoice_libritts_p_no_zero_init
+      checkpoint_name=epoch-80.pt
+      res_dir=results/test_libritts_e80_t0_sft
+
       python3 -m zipvoice.bin.infer_zipvoice \
             --model-name zipvoice \
-            --model-dir exp/zipvoice_libritts_p_no_zero_init \
-            --checkpoint-name epoch-80-avg-10.pt \
+            --model-dir ${model_dir} \
+            --checkpoint-name ${checkpoint_name} \
             --tokenizer libritts \
             --test-list download/librispeech_pc_testset/test.tsv \
-            --res-dir results/test_libritts_e80_avg10_t1 \
+            --res-dir ${res_dir} \
             --num-step 8 \
+            --temperature 0.0 \
             --guidance-scale 1 \
             --t-shift 0.7 \
             --raw-evaluation True

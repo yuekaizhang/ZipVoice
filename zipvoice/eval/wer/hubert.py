@@ -60,7 +60,7 @@ def get_parser():
         type=str,
         default=None,
         help="Path to the output file where WER information will be saved. "
-        "If not provided, results are only printed to console.",
+        "If not provided, it defaults to {wav_path}/wer_results.txt.",
     )
     parser.add_argument(
         "--model-dir",
@@ -299,6 +299,9 @@ if __name__ == "__main__":
 
     parser = get_parser()
     args = parser.parse_args()
+    if args.decode_path is None:
+        args.decode_path = os.path.join(args.wav_path, "wer_results.txt")
+
     if torch.cuda.is_available():
         device = torch.device("cuda", 0)
     else:

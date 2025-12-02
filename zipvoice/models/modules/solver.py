@@ -94,6 +94,7 @@ class DiffusionModel(torch.nn.Module):
         speech_condition: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         guidance_scale: Union[float, torch.Tensor] = 0.0,
+        temperature: float = 1.0,
         **kwargs
     ) -> torch.Tensor:
         """
@@ -166,11 +167,8 @@ class DiffusionModel(torch.nn.Module):
                 mu = mu_cond + guidance_scale * (mu_cond - mu_uncond)
                 ln_sigma = ln_sigma_cond + guidance_scale * (ln_sigma_cond - ln_sigma_uncond)
                 snd = torch.randn_like(mu)
-                if t < 0.01:
-                    temperature = 40
-                else:
-                    temperature = 1
-                # temperature = 0
+                # if t < 0.01:
+                #     temperature = 40
                 v = mu + snd * torch.exp(ln_sigma) * temperature
                 return mu, ln_sigma, v
             else:
@@ -323,6 +321,7 @@ class EulerSolver:
         enable_sde: bool = False,
         sde_noise_level: float = 0.1,
         enable_ln_sigma_sampling: bool = False,
+        temperature: float = 1.0,
         **kwargs
     ) -> torch.Tensor:
         """
@@ -372,6 +371,7 @@ class EulerSolver:
                 speech_condition=speech_condition,
                 padding_mask=padding_mask,
                 guidance_scale=guidance_scale,
+                temperature=temperature,
                 **kwargs,
             )
             if enable_ln_sigma_sampling:
@@ -396,20 +396,21 @@ class EulerSolver:
                 # breakpoint()
                 x = x + v * (timesteps[step + 1] - timesteps[step])
         
-        if enable_ln_sigma_sampling:
-                prob = torch.exp(- F.mse_loss(mu, v, reduction='none') / (2 * (torch.exp(ln_sigma) ** 2)))
-                prob = prob / torch.exp(ln_sigma)
-                # Compute log_prob per sample, considering padding.
-                log_prob_tensor = torch.log(prob)
-                valid_mask = ~padding_mask.unsqueeze(-1)  # (B, T, 1)
-                log_prob_tensor = log_prob_tensor * valid_mask
+            if enable_ln_sigma_sampling:
+                    prob = torch.exp(- F.mse_loss(mu, v, reduction='none') / (2 * (torch.exp(ln_sigma) ** 2)))
+                    prob = prob / torch.exp(ln_sigma)
+                    # Compute log_prob per sample, considering padding.
+                    log_prob_tensor = torch.log(prob + 1e-6)
+                    valid_mask = ~padding_mask.unsqueeze(-1)  # (B, T, 1)
+                    log_prob_tensor = log_prob_tensor * valid_mask
 
-                num_valid_elements = (~padding_mask).sum(dim=1) * prob.shape[-1]
-                num_valid_elements = num_valid_elements.clamp(min=1.0)
+                    num_valid_elements = (~padding_mask).sum(dim=1) * prob.shape[-1]
+                    num_valid_elements = num_valid_elements.clamp(min=1.0)
 
-                log_prob = log_prob_tensor.sum(dim=(1, 2)) / num_valid_elements
-                log_probs.append(log_prob)
-                latents.append(x)
+                    log_prob = log_prob_tensor.sum(dim=(1, 2)) / num_valid_elements
+                    log_probs.append(log_prob)
+
+                    latents.append(x)
 
         if enable_sde:
             return x, log_probs, latents, timesteps, prev_sample_means, std_dev_ts

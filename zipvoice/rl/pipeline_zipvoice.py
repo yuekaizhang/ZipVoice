@@ -159,6 +159,7 @@ class ZipVoicePipeline(object):
         target_rms: float = 0.1,
         feat_scale: float = 0.1,
         enable_sde: bool = True,
+        temperature: float = 1.0,
         sde_noise_level: float = 0.2,
         enable_ln_sigma_sampling: bool = False,
     ) -> List[torch.Tensor]:
@@ -193,6 +194,7 @@ class ZipVoicePipeline(object):
             enable_sde=enable_sde,
             sde_noise_level=sde_noise_level,
             enable_ln_sigma_sampling=enable_ln_sigma_sampling,
+            temperature=temperature,
         )
 
         # if enable_sde:

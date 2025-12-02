@@ -79,6 +79,9 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
       export CUDA_VISIBLE_DEVICES=1
       model_path=${download_dir}/tts_eval_models
       wav_path=results/test_libritts_e80_avg10_t0
+      wav_path=results/test_libritts_e80_avg1_t0_rl_100
+      wav_path=results/test_libritts_e80_t0_sft
+
       test_tsv=${download_dir}/librispeech_pc_testset/test.tsv
       # Use LibriSpeech style transcripts for WER evaluation
       transcript_tsv=${download_dir}/librispeech_pc_testset/transcript.tsv

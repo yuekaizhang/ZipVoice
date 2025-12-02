@@ -295,6 +295,13 @@ def get_parser():
         default=None,
         help="The path to the TensorRT engine file.",
     )
+
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for sampling.",
+    )
     return parser
 
 
@@ -329,6 +336,7 @@ def generate_sentence_raw_evaluation(
     target_rms: float = 0.1,
     feat_scale: float = 0.1,
     sampling_rate: int = 24000,
+    temperature: float = 1.0,
 ):
     """
     Generate waveform of a text based on a given prompt waveform and its transcription,
@@ -359,6 +367,8 @@ def generate_sentence_raw_evaluation(
             Defaults to 0.1.
         sampling_rate (int, optional): Sampling rate for the waveform.
             Defaults to 24000.
+        temperature (float, optional): Temperature for sampling.
+            Defaults to 1.0.
     Returns:
         metrics (dict): Dictionary containing time and real-time
             factor metrics for processing.
@@ -403,6 +413,7 @@ def generate_sentence_raw_evaluation(
         num_step=num_step,
         guidance_scale=guidance_scale,
         enable_ln_sigma_sampling=True,
+        temperature=temperature,
     )
 
     # Postprocess predicted features
@@ -663,6 +674,7 @@ def generate_list(
     raw_evaluation: bool = False,
     max_duration: float = 100,
     remove_long_sil: bool = False,
+    temperature: float = 1.0,
 ):
     total_t = []
     total_t_no_vocoder = []
@@ -693,6 +705,7 @@ def generate_list(
             "target_rms": target_rms,
             "feat_scale": feat_scale,
             "sampling_rate": sampling_rate,
+            "temperature": temperature,
         }
 
         if raw_evaluation:
@@ -867,6 +880,7 @@ def main():
             raw_evaluation=params.raw_evaluation,
             max_duration=params.max_duration,
             remove_long_sil=params.remove_long_sil,
+            temperature=params.temperature,
         )
     else:
         assert (

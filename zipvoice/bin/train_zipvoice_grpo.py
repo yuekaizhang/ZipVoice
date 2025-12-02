@@ -162,6 +162,10 @@ class SpeechPromptDataset(Dataset):
         self.prompt_dataset = load_dataset(
             "CristianaLazar/librispeech_test", trust_remote_code=True
         )["test"]
+        # self.prompt_dataset = load_dataset(
+        #     "yuekai/librispeech_pc_testset", trust_remote_code=True
+        # )["test"]
+
 
     def __len__(self):
         return len(self.target_texts)
@@ -170,9 +174,13 @@ class SpeechPromptDataset(Dataset):
         prompt_idx = idx % len(self.prompt_dataset)
         sample = self.prompt_dataset[prompt_idx]
 
-        prompt_text = sample["text"].replace(" ", "")
-
+        prompt_text = sample["text"]
+        # prompt_text = prompt_text.replace(" ", "")
+        prompt_text = prompt_text.lower()
         audio_data = sample["audio"]
+        # audio_data = sample["prompt_audio"]
+        # prompt_text = sample["prompt_text"]
+
         # The audio array is already a numpy array, convert it to a tensor.
         audio_array = torch.from_numpy(audio_data["array"]).float()
         sample_rate = audio_data["sampling_rate"]
@@ -330,10 +338,10 @@ def asr_reward_computation_en(
         _, processed_hypo, wer, _, _, _, _ = process_one(hypo, truth)
 
         # Reward is 1 - WER. WER from process_one is a fraction.
-        # FIXME: WER to reward mapping 
+        # FIXME: WER to reward mapping
         rewards.append(get_reward_value(wer))
         processed_transcripts.append(processed_hypo)
-        print("ground truth: ", truth, "processed transcript: ", processed_hypo, "WER: ", wer)
+        logging.info(f"ground truth: {truth}, processed transcript: {processed_hypo}, WER: {wer}")
 
     return {"asr_reward": rewards}, {"transcripts": processed_transcripts}
 
@@ -479,6 +487,7 @@ def evaluate(
     epoch: int,
     global_step: int,
     reward_fn: Callable,
+    eval_dataloader: DataLoader,
 ):
     """Run evaluation and log metrics."""
     if rank == 0:
@@ -490,30 +499,8 @@ def evaluate(
     eval_dir = Path(params.exp_dir) / f"eval_step_{global_step}"
     if rank == 0:
         os.makedirs(eval_dir, exist_ok=True)
-
-    # Dataset and Dataloader for evaluation
-    dataset_name = "yuekai/CV3-Eval" if 'zero' in params.huggingface_dataset_split else "yuekai/seed_tts_cosy2"
-    eval_dataset = load_dataset(
-        dataset_name,
-        split=params.huggingface_dataset_split,
-        trust_remote_code=True,
-    )
-    eval_dataset = eval_dataset.select(range(64))
     if world_size > 1:
-        eval_sampler = torch.utils.data.distributed.DistributedSampler(
-            eval_dataset, shuffle=False
-        )
-    else:
-        eval_sampler = None
-
-    eval_dataloader = DataLoader(
-        eval_dataset,
-        batch_size=params.eval_batch_size,
-        shuffle=False,
-        sampler=eval_sampler,
-        num_workers=0,
-        collate_fn=eval_collate_fn,
-    )
+        dist.barrier()
 
     pipeline.model.eval()
 
@@ -540,11 +527,12 @@ def evaluate(
                     prompt_text=prompt_texts_list,
                     prompt_wav=prompt_wavs_list,
                     text=target_texts_list,
-                    num_step=params.num_steps,
+                    num_step=8,
                     guidance_scale=params.guidance_scale,
                     enable_sde=False if pipeline.model.enable_ln_sigma_sampling else True,
                     enable_ln_sigma_sampling=pipeline.model.enable_ln_sigma_sampling,
                     temperature=0.0,
+                    t_shift=0.7,
                     sde_noise_level=0.0,
                 )
 
@@ -729,7 +717,7 @@ def train(params: AttributeDict, rank: int, world_size: int):
     # Setup logging
     if rank == 0:
         wandb.init(project="flow_grpo_tts", name=params.run_name)
-    logging.info(f"\n{params}")
+        logging.info(f"\n{params}")
 
     # Load TTS model via pipeline
     tokenizer_type = "libritts" if "libritts" in params.model_dir else "emilia"
@@ -778,6 +766,32 @@ def train(params: AttributeDict, rank: int, world_size: int):
         collate_fn=SpeechPromptDataset.collate_fn,
     )
 
+    # Create evaluation dataloader once
+    dataset_name = "yuekai/CV3-Eval" if 'zero' in params.huggingface_dataset_split else "yuekai/seed_tts_cosy2"
+    if params.huggingface_dataset_split == "test":
+        dataset_name = "yuekai/librispeech_pc_testset"
+    eval_dataset = load_dataset(
+        dataset_name,
+        split=params.huggingface_dataset_split,
+        trust_remote_code=True,
+    )
+    # eval_dataset = eval_dataset.select(range(64))
+    if world_size > 1:
+        eval_sampler = torch.utils.data.distributed.DistributedSampler(
+            eval_dataset, shuffle=False
+        )
+    else:
+        eval_sampler = None
+
+    eval_dataloader = DataLoader(
+        eval_dataset,
+        batch_size=params.eval_batch_size,
+        shuffle=False,
+        sampler=eval_sampler,
+        num_workers=0,
+        collate_fn=eval_collate_fn,
+    )
+
     scaler = create_grad_scaler(enabled=params.use_fp16)
 
     if "libritts" in params.model_dir:
@@ -805,14 +819,15 @@ def train(params: AttributeDict, rank: int, world_size: int):
     executor = futures.ThreadPoolExecutor(max_workers=2)
     autocast = partial(torch_autocast, dtype=torch.float16, enabled=params.use_fp16)
 
-    logging.info("***** Running training *****")
+    if rank == 0:
+        logging.info("***** Running training *****")
 
     epoch = 0
     global_step = 0
     train_iter = iter(train_dataloader)
     # num_train_timesteps = params.num_steps - 1
     num_train_timesteps = params.num_steps
-    # num_train_timesteps = 1
+    num_train_timesteps = 1
     while True:
         #################### SAMPLING ####################
         if isinstance(model, DDP):
@@ -957,10 +972,38 @@ def train(params: AttributeDict, rank: int, world_size: int):
             # del s["rewards"]
             del s["prompts"]
 
-        # remove sample if all advantages are equal
-        print(f"Before removing samples: {len(samples)}")
-        samples = [s for s in samples if not all(s["advantages"].unique() == s["advantages"].mean())]
-        print(f"After removing samples: {len(samples)}")
+        # remove sample if all advantages are equal to avoid instability.
+        # This needs to be synchronized across all ranks to avoid DDP hangs.
+        if rank == 0:
+            logging.info(f"Number of samples before filtering: {len(samples)}")
+
+        # A batch is considered to have constant advantages if there is only one unique value.
+        is_constant_adv_mask = torch.tensor(
+            [
+                1.0 if s["advantages"].unique().shape[0] == 1 else 0.0
+                for s in samples
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+
+        if world_size > 1:
+            # Synchronize the mask. A batch is discarded only if all ranks agree
+            # (i.e., advantages are constant on all ranks for that batch).
+            dist.all_reduce(is_constant_adv_mask, op=dist.ReduceOp.SUM)
+        
+        # A batch is kept if at least one rank has non-constant advantages.
+        # It's discarded only if all ranks (sum == world_size) have constant advantages.
+        keep_mask = is_constant_adv_mask < world_size
+
+        original_num_samples = len(samples)
+        samples = [s for i, s in enumerate(samples) if keep_mask[i]]
+        
+        if rank == 0:
+            num_removed = original_num_samples - len(samples)
+            if num_removed > 0:
+                logging.info(f"Removed {num_removed} samples with constant advantages.")
+            logging.info(f"Number of samples after filtering: {len(samples)}")
         #################### TRAINING ####################
         for inner_epoch in range(params.num_inner_epochs):
             if isinstance(model, DDP):
@@ -978,7 +1021,7 @@ def train(params: AttributeDict, rank: int, world_size: int):
                 total=len(samples)
             ):
                 if global_step % params.eval_freq == 0:
-                    evaluate(params, rank, world_size, pipeline, epoch, global_step, reward_fn)
+                    evaluate(params, rank, world_size, pipeline, epoch, global_step, reward_fn, eval_dataloader)
                     # Restore model to training mode after evaluation
                     if isinstance(model, DDP):
                         model.module.train()

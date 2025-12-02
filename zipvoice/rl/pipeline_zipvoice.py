@@ -19,7 +19,7 @@ from zipvoice.tokenizer.tokenizer import (
 from zipvoice.utils.checkpoint import load_checkpoint
 from zipvoice.utils.common import AttributeDict
 from zipvoice.utils.feature import VocosFbank
-from zipvoice.utils.infer import load_prompt_wav, rms_norm
+from zipvoice.utils.infer import load_prompt_wav, rms_norm, remove_silence, add_punctuation
 
 
 HUGGINGFACE_REPO = "k2-fsa/ZipVoice"
@@ -263,6 +263,11 @@ class ZipVoicePipeline(object):
         prompt_features_list = []
         prompt_rms_list = []
         for p_wav in prompt_wavs_list:
+            # add optimization here: remove silence
+            # p_wav = remove_silence(
+            #     p_wav, self.sampling_rate, only_edge=False, trail_sil=200
+            # )
+
             p_wav, prompt_rms = rms_norm(p_wav, target_rms)
             prompt_rms_list.append(prompt_rms)
             prompt_features = self.feature_extractor.extract(
@@ -277,6 +282,11 @@ class ZipVoicePipeline(object):
             prompt_features_list, batch_first=True, padding_value=0.0
         )
         prompt_features = prompt_features * feat_scale
+
+        # Optimization: add punctuation here
+        # text = [add_punctuation(t) for t in text]
+        # prompt_text = [add_punctuation(t) for t in prompt_text]
+
 
         tokens = self.tokenizer.texts_to_token_ids(text)
         prompt_tokens = self.tokenizer.texts_to_token_ids(prompt_text)

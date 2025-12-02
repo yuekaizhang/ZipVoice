@@ -167,8 +167,14 @@ class DiffusionModel(torch.nn.Module):
                 mu = mu_cond + guidance_scale * (mu_cond - mu_uncond)
                 ln_sigma = ln_sigma_cond + guidance_scale * (ln_sigma_cond - ln_sigma_uncond)
                 snd = torch.randn_like(mu)
-                # if t < 0.01:
-                #     temperature = 40
+                if temperature == 0.0:
+                    # inference mode
+                    pass
+                else:
+                    if t < 0.01:
+                        temperature = 40
+                    else:
+                        temperature = 0.0
                 v = mu + snd * torch.exp(ln_sigma) * temperature
                 return mu, ln_sigma, v
             else:
@@ -396,7 +402,7 @@ class EulerSolver:
                 # breakpoint()
                 x = x + v * (timesteps[step + 1] - timesteps[step])
         
-            if enable_ln_sigma_sampling:
+            if (enable_ln_sigma_sampling and step == 0):
                     prob = torch.exp(- F.mse_loss(mu, v, reduction='none') / (2 * (torch.exp(ln_sigma) ** 2)))
                     prob = prob / torch.exp(ln_sigma)
                     # Compute log_prob per sample, considering padding.
